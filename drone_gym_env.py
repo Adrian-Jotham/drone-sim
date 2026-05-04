@@ -30,6 +30,89 @@ import newton
 import newton.solvers
 
 
+# ── Crazyflie mesh helpers ────────────────────────────────────────────────
+
+_CRAZYFLIE_MESH_NAME = "/crazyflie/body"
+
+
+def _load_crazyflie_mesh(arm_length: float):
+    """Extract body geometry from crazyflie.usd, transform Y-up→Z-up, scale to arm_length.
+
+    Returns (points, indices, normals) as warp arrays, or None on failure.
+    """
+    try:
+        import newton.examples
+        from pxr import Gf, Usd, UsdGeom
+    except ImportError:
+        return None
+
+    usd_path = newton.examples.get_asset("crazyflie.usd")
+    stage = Usd.Stage.Open(usd_path)
+
+    all_verts, all_faces = [], []
+    vert_offset = 0
+
+    for prim in stage.Traverse():
+        if prim.GetTypeName() != "Mesh":
+            continue
+        if "propeller" in str(prim.GetPath()).lower():
+            continue
+
+        mesh = UsdGeom.Mesh(prim)
+        pts = mesh.GetPointsAttr().Get()
+        fvc = mesh.GetFaceVertexCountsAttr().Get()
+        fvi = mesh.GetFaceVertexIndicesAttr().Get()
+        if pts is None or fvc is None or fvi is None:
+            continue
+
+        world_mat = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(0)
+        verts = np.array(
+            [[*world_mat.Transform(Gf.Vec3d(*p))] for p in pts], dtype=np.float32
+        )
+
+        tris, idx = [], 0
+        for cnt in fvc:
+            for k in range(1, cnt - 1):
+                tris.append([fvi[idx], fvi[idx + k], fvi[idx + k + 1]])
+            idx += cnt
+
+        all_verts.append(verts)
+        all_faces.append(np.array(tris, dtype=np.int32) + vert_offset)
+        vert_offset += len(verts)
+
+    if not all_verts:
+        return None
+
+    verts = np.concatenate(all_verts)
+    faces = np.concatenate(all_faces)
+
+    # Y-up → Z-up: (x, y, z) → (x, -z, y)
+    verts = np.stack([verts[:, 0], -verts[:, 2], verts[:, 1]], axis=1)
+
+    # Scale so XY extent matches arm_length
+    xy_ext = np.abs(verts[:, :2]).max()
+    verts *= arm_length / xy_ext
+
+    # Center vertically around Z=0
+    verts[:, 2] -= (verts[:, 2].max() + verts[:, 2].min()) * 0.5
+
+    # Per-vertex normals via area-weighted face normal accumulation
+    norms = np.zeros_like(verts)
+    v0, v1, v2 = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
+    fn = np.cross(v1 - v0, v2 - v0)
+    np.add.at(norms, faces[:, 0], fn)
+    np.add.at(norms, faces[:, 1], fn)
+    np.add.at(norms, faces[:, 2], fn)
+    nlen = np.linalg.norm(norms, axis=1, keepdims=True)
+    norms /= np.where(nlen > 1e-8, nlen, 1.0)
+
+    return (
+        wp.array(verts, dtype=wp.vec3),
+        wp.array(faces.flatten(), dtype=wp.int32),
+        wp.array(norms.astype(np.float32), dtype=wp.vec3),
+    )
+
+
 # ── Simulation constants ──────────────────────────────────────────────────
 
 FPS               = 100          # Hz — matches paper's simulator frequency
@@ -167,6 +250,7 @@ class DroneEnv(gymnasium.Env):
             low=-1.0, high=1.0, shape=(4,), dtype=np.float32,
         )
 
+        self._has_drone_mesh = False
         self._build_sim()
 
         self._step_count  = 0
@@ -215,6 +299,16 @@ class DroneEnv(gymnasium.Env):
 
         if self._viewer is not None:
             self._viewer.set_model(self._model)
+            self._setup_drone_mesh()
+
+    def _setup_drone_mesh(self) -> None:
+        mesh = _load_crazyflie_mesh(DRONE_SIZE)
+        if mesh is None:
+            self._has_drone_mesh = False
+            return
+        points, indices, normals = mesh
+        self._viewer.log_mesh(_CRAZYFLIE_MESH_NAME, points, indices, normals=normals)
+        self._has_drone_mesh = True
 
     # ── Observation ───────────────────────────────────────────────────────
 
@@ -399,6 +493,22 @@ class DroneEnv(gymnasium.Env):
         self._render_t += SIM_DT
         self._viewer.begin_frame(self._render_t)
         self._viewer.log_state(self._state)
+        if self._has_drone_mesh:
+            q_np = self._state.body_q.numpy()[0]
+            quat = q_np[3:]
+            drone_tf = wp.array(
+                [wp.transform(
+                    wp.vec3(*q_np[:3].tolist()),
+                    wp.quat(float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])),
+                )],
+                dtype=wp.transform,
+            )
+            self._viewer.log_instances(
+                "/drone/body", _CRAZYFLIE_MESH_NAME, drone_tf,
+                scales=None,
+                colors=wp.array([wp.vec3(0.2, 0.2, 0.25)], dtype=wp.vec3),
+                materials=None,
+            )
         self._viewer.log_shapes(
             "/target",
             newton.GeoType.SPHERE, (0.05,),

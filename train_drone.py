@@ -36,7 +36,10 @@ import newton.examples
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from drone_gym_env import DroneEnv, MAX_EPISODE_STEPS, FPS, SIM_DT, DRONE_SIZE
+from drone_gym_env import (
+    DroneEnv, MAX_EPISODE_STEPS, FPS, SIM_DT, DRONE_SIZE,
+    _CRAZYFLIE_MESH_NAME, _load_crazyflie_mesh,
+)
 
 
 # ── Curriculum callback ───────────────────────────────────────────────────
@@ -76,6 +79,13 @@ class RenderCallback(BaseCallback):
         self._render_t    = 0.0
         n = train_vec_env.num_envs
         self._grid_cols = max(1, math.ceil(math.sqrt(n)))
+        self._has_drone_mesh = False
+        if viewer is not None:
+            mesh = _load_crazyflie_mesh(DRONE_SIZE)
+            if mesh is not None:
+                points, indices, normals = mesh
+                viewer.log_mesh(_CRAZYFLIE_MESH_NAME, points, indices, normals=normals)
+                self._has_drone_mesh = True
 
     def _on_step(self) -> bool:
         if self._viewer is None:
@@ -115,12 +125,21 @@ class RenderCallback(BaseCallback):
         self._render_t += SIM_DT
         try:
             self._viewer.begin_frame(self._render_t)
-            self._viewer.log_shapes(
-                "/train/drones", newton.GeoType.BOX,
-                (DRONE_SIZE, DRONE_SIZE, DRONE_SIZE * 0.08),
-                wp.array(drone_tfs,    dtype=wp.transform),
-                wp.array(drone_colors, dtype=wp.vec3),
-            )
+            if self._has_drone_mesh:
+                self._viewer.log_instances(
+                    "/train/drones", _CRAZYFLIE_MESH_NAME,
+                    wp.array(drone_tfs,    dtype=wp.transform),
+                    scales=None,
+                    colors=wp.array(drone_colors, dtype=wp.vec3),
+                    materials=None,
+                )
+            else:
+                self._viewer.log_shapes(
+                    "/train/drones", newton.GeoType.BOX,
+                    (DRONE_SIZE, DRONE_SIZE, DRONE_SIZE * 0.08),
+                    wp.array(drone_tfs,    dtype=wp.transform),
+                    wp.array(drone_colors, dtype=wp.vec3),
+                )
             self._viewer.log_shapes(
                 "/train/targets", newton.GeoType.SPHERE, (0.07,),
                 wp.array(target_tfs,    dtype=wp.transform),
