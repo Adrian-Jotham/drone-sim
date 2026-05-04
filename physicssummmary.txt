@@ -1,0 +1,29 @@
+Physics Engine & What's Modeled Well
+Both envs use Newton + Warp at 100 Hz with a SemiImplicit integrator. The propeller physics are grounded in real aerodynamics:
+
+Thrust model (drone_gym_env.py:194-208):
+
+
+p.max_thrust = thrust * rho * rps_sq * diam ** 4   # F = C_T·ρ·n²·D⁴
+p.max_torque = power  * rho * rps_sq * diam ** 5/ wp.TAU  # Q = C_P·ρ·n²·D⁵/2π
+These are the correct aerodynamic propeller equations. Air density is 1.225 kg/m³ (standard sea level).
+
+Motor dynamics (drone_gym_env.py:123-125): A first-order low-pass filter with τ = 0.15 s — this matches documented Crazyflie ESC/motor lag from real hardware papers. Alternating rotor spin directions (CW/CCW) are correctly modeled with reactive torques.
+
+The hover env is explicitly based on Eschmann et al., RAL 2024 ("Learning to Fly in Seconds"), a peer-reviewed paper.
+
+What's Missing / Simplified
+Missing physics	Impact
+No aerodynamic body drag	At speed, real drones slow down from airframe drag — not modeled
+No ground effect	Critical for landing — rotor efficiency increases near the ground, not simulated
+No wind / turbulence	Real-world disturbances absent (obs noise is just Gaussian)
+No battery model	Thrust doesn't degrade over time
+Torque fudge factor 0.8 (line 186)	torque *= 0.8 — unexplained empirical correction
+Semi-implicit integrator	Can have energy drift at high velocities vs. more accurate solvers
+Landing detection by thresholds	In drone_landing_env.py, landing is checked via distance/speed conditions, not actual contact forces
+Platform has no physical body	The landing pad is a visual; there's no contact geometry for it
+Parameter Mismatch
+The code loads a Crazyflie mesh but the physical parameters (DRONE_SIZE = 0.2m half-span, max_rpm = 6396, prop diameter 0.2286m) correspond to a mid-size drone (~40cm span, 9-inch props), not an actual Crazyflie (92mm arm, 46mm props, ~25k RPM). The visual and physics are inconsistent.
+
+Summary
+Medium-fidelity simulator — appropriate for RL policy development and matches established academic practice for sim-to-real work. The thrust/torque equations are correct, motor lag is realistic, and the integrator is solid for control-frequency work. However, it lacks ground effect (especially important for drone_landing), body drag, and the Crazyflie mesh doesn't match the simulated physical parameters. Policies trained here will likely need fine-tuning for real hardware deployment.

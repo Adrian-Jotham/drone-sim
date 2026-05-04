@@ -117,7 +117,7 @@ def _load_crazyflie_mesh(arm_length: float):
 
 FPS               = 100          # Hz — matches paper's simulator frequency
 SIM_DT            = 1.0 / FPS
-DRONE_SIZE        = 0.2          # half-span (m)
+DRONE_SIZE        = 0.092          # half-span (m)
 MAX_EPISODE_STEPS = 500          # 5 s at 100 Hz
 
 # First-order motor low-pass filter (paper §IV, τ ≈ 0.15 s for Crazyflie)

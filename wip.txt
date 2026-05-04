@@ -1,0 +1,16 @@
+Works with zero or minimal code changes:
+
+Waypoint navigation / racing — set_target() (drone_gym_env.py:481) already exists for mid-episode target switching. Chain targets in sequence for a race course.
+Trajectory tracking — call set_target() every N steps with a pre-planned path (circle, figure-8, helix). The 22-D obs already has velocity, so the policy can learn to anticipate.
+Attitude stabilization only — zero out the position error reward terms, keep orientation + angular velocity penalties. Useful for learning a low-level stabilizer before adding position control.
+Small reward / env modifications:
+
+Disturbance rejection / robustness — inject random forces each step (self._state.body_f) to simulate wind. The curriculum system is already wired for this kind of progressive hardening.
+Motor fault tolerance — clamp one motor_fracs channel to 0 mid-episode. Tests if a policy can recover from a rotor failure.
+Inverted / aggressive maneuvers — remove the R22 < -0.5 termination and reshape the orientation reward. The rigid body sim can handle full flips.
+Multi-waypoint patrol / coverage — auto-advance target when dist < threshold, log lap time. Competitive benchmark between policies.
+Larger additions:
+
+Payload / slung load — add a second body connected by a Newton spring/constraint to the drone body. Tests swing damping.
+Obstacle avoidance — add static box shapes to the Newton scene; add distance-to-nearest-obstacle to the obs.
+Multi-agent formation — run N independent DroneEnv instances sharing a Newton scene, add inter-agent distance terms to the reward.
