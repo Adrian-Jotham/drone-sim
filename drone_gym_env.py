@@ -13,12 +13,20 @@ Observation layout (22-D):
   [18:22] a_prev — last action (action history N_H=1)
 
 Action (4-D, ∈ [-1, 1]):
-  Normalised motor setpoints, hover-centred (0 → stable hover).
+  Normalised RPM setpoints, hover-centred (0 → stable hover).
+  Maps to actual motor RPMs: n_sp = CF_HOVER_RPM + action × CF_RPM_RANGE
   First-order low-pass motor dynamics applied internally (τ = 0.15 s).
+  Physics: F = CF_KT × n², Q = CF_KD × n²  (Level 5.1 — direct RPM control)
 
 Reward (paper Eq. 1):
-  r = −C_rp‖p_err‖² − C_rq(1−qw²) − C_rv‖v‖² − C_rω‖ω‖² − C_ra‖a‖² + C_rs
+  r = −C_rp‖p_err‖² − C_rq(1−qw²) − C_rv‖v‖² − C_rω‖ω‖² − C_ra‖Δa‖² + C_rs
   Weights ramp from conservative to strict via env.curriculum ∈ [0, 1].
+
+Crazyflie 2.x physical parameters (Förster 2015 system ID + Bitcraze docs):
+  Mass:  27 g,  Arm: 32.5 mm
+  Ixx = Iyy = 1.657e-5 kg·m²,  Izz = 2.9e-5 kg·m²
+  KT = 3.16e-10 N/RPM²,  KD = 7.94e-12 N·m/RPM²
+  Max RPM: 21 702,  Hover RPM: ≈ 14 476
 """
 
 import numpy as np
@@ -117,22 +125,44 @@ def _load_crazyflie_mesh(arm_length: float):
 
 FPS               = 100          # Hz — matches paper's simulator frequency
 SIM_DT            = 1.0 / FPS
-DRONE_SIZE        = 0.092          # half-span (m)
 MAX_EPISODE_STEPS = 500          # 5 s at 100 Hz
 
-# First-order motor low-pass filter (paper §IV, τ ≈ 0.15 s for Crazyflie)
-MOTOR_TAU   = 0.15
-MOTOR_ALPHA = SIM_DT / MOTOR_TAU  # ≈ 0.067 per step
+# ── Crazyflie 2.x physical parameters ────────────────────────────────────
+# Sources: Förster 2015 (ETH system ID), Bitcraze documentation, Eschmann 2024
 
-# Hover-centred action map: action=0 → hover, action=±1 → hover ± THRUST_RANGE
-HOVER_FRAC   = 0.33
-THRUST_RANGE = 0.33
+CF_MASS  = 0.027       # kg  — total vehicle mass (27 g)
+CF_ARM   = 0.0325      # m   — centre-to-motor distance (32.5 mm)
+
+# Inertia tensor (diagonal, body frame), Förster 2015:
+CF_IXX   = 1.657e-5    # kg·m²
+CF_IYY   = 1.657e-5    # kg·m²
+CF_IZZ   = 2.900e-5    # kg·m²
+
+# Blade-element thrust / torque constants (F = KT·n², Q = KD·n², n in RPM):
+# Derived from: max thrust ≈ 15.2 g per motor at 21 702 RPM
+CF_KT    = 3.16e-10    # N / RPM²
+CF_KD    = 7.94e-12    # N·m / RPM²
+
+# Motor speed limits
+CF_MAX_RPM = 21702.0   # RPM — full-throttle
+CF_MIN_RPM = 1000.0    # RPM — idle (ESC minimum; prevents motor cut-off)
+
+# Hover RPM: 4·KT·n² = m·g  →  n = sqrt(m·g / 4·KT)
+CF_HOVER_RPM = float(np.sqrt(CF_MASS * 9.81 / (4.0 * CF_KT)))  # ≈ 14 476 RPM
+
+# Action → RPM:  n_sp = CF_HOVER_RPM + action·CF_RPM_RANGE
+# Symmetric range so action=0 ↔ hover, ±1 ↔ min/max RPM
+CF_RPM_RANGE = CF_MAX_RPM - CF_HOVER_RPM  # ≈ 7 226 RPM
+
+# Motor first-order LPF (paper §IV: τ ≈ 0.15 s for Crazyflie)
+MOTOR_TAU   = 0.15
+MOTOR_ALPHA = SIM_DT / MOTOR_TAU   # ≈ 0.067 per step
 
 # Observation / action sizes
 N_ACTION_HIST = 1
 OBS_DIM       = 3 + 9 + 3 + 3 + N_ACTION_HIST * 4   # 22
 
-# Training waypoints (fixed positions; randomised at reset when random_targets=True)
+# Training waypoints
 TARGETS = [
     np.array([ 1.0,  0.0, 0.5], dtype=np.float32),
     np.array([ 0.0,  1.0, 0.5], dtype=np.float32),
@@ -142,69 +172,59 @@ TARGETS = [
 
 # ── Reward weight curriculum ──────────────────────────────────────────────
 # env.curriculum ∈ [0,1]: 0 = init (easy), 1 = target (hard).
-# Small init weights let the drone survive early on; large target weights
-# enforce tight position + velocity control after the policy can fly.
 
 _C_RP_INIT, _C_RP_TGT = 0.05, 1.00   # position error ‖p_err‖²
 _C_RV_INIT, _C_RV_TGT = 0.01, 0.30   # linear velocity ‖v‖²
 _C_RW_INIT, _C_RW_TGT = 0.001, 0.05  # angular velocity ‖ω‖²
-_C_RA_INIT, _C_RA_TGT = 0.005, 0.02  # action regularisation ‖a‖²
+_C_RA_INIT, _C_RA_TGT = 0.005, 0.02  # action-change regularisation ‖Δa‖²
 
 _C_RQ = 0.10   # orientation cost  (1 − qw²)  — fixed
 _C_RS = 0.50   # survival bonus per step       — fixed
 
 
-# ── Propeller physics ─────────────────────────────────────────────────────
+# ── Propeller physics (Level 5.1 — direct RPM) ───────────────────────────
 
 @wp.struct
 class Propeller:
     body:              int
     pos:               wp.vec3
     dir:               wp.vec3
-    max_thrust:        float
-    max_torque:        float
-    turning_direction: float
+    kt:                float        # N / RPM² thrust coefficient
+    kd:                float        # N·m / RPM² drag-torque coefficient
+    turning_direction: float        # +1 CCW, −1 CW (determines reaction torque sign)
 
 
 @wp.kernel
 def _apply_prop_forces(
-    props:       wp.array[Propeller],
-    motor_fracs: wp.array[float],
-    body_q:      wp.array[wp.transform],
-    body_com:    wp.array[wp.vec3],
-    body_f:      wp.array[wp.spatial_vector],
+    props:      wp.array[Propeller],
+    motor_rpms: wp.array[float],         # filtered motor speed [RPM] per rotor
+    body_q:     wp.array[wp.transform],
+    body_com:   wp.array[wp.vec3],
+    body_f:     wp.array[wp.spatial_vector],
 ):
     tid  = wp.tid()
     prop = props[tid]
-    frac = motor_fracs[tid]
-    tf   = body_q[prop.body]
-    d    = wp.transform_vector(tf, prop.dir)
-    force  = d * prop.max_thrust * frac
-    torque = d * prop.max_torque * frac * prop.turning_direction
+    rpm  = motor_rpms[tid]
+    n2   = rpm * rpm                     # RPM² for quadratic thrust/torque model
+
+    tf     = body_q[prop.body]
+    d      = wp.transform_vector(tf, prop.dir)
+
+    thrust = d * (prop.kt * n2)
+    torque = d * (prop.kd * n2 * prop.turning_direction)
     arm    = wp.transform_point(tf, prop.pos) - wp.transform_point(tf, body_com[prop.body])
-    torque += wp.cross(arm, force)
-    torque *= 0.8
-    wp.atomic_add(body_f, prop.body, wp.spatial_vector(force, torque))
+    torque = torque + wp.cross(arm, thrust)
+
+    wp.atomic_add(body_f, prop.body, wp.spatial_vector(thrust, torque))
 
 
-def _make_prop(
-    body: int,
-    pos: wp.vec3,
-    turning_direction: float = 1.0,
-    thrust: float  = 0.109919,
-    power:  float  = 0.040164,
-    diam:   float  = 0.2286,
-    max_rpm: float = 6396.667,
-) -> Propeller:
-    rho    = 1.225
-    rps    = max_rpm / 60.0   # physical rev/s — independent of simulation FPS
-    rps_sq = rps ** 2
-    p = Propeller()
+def _make_prop(body: int, pos: wp.vec3, turning_direction: float = 1.0) -> Propeller:
+    p                   = Propeller()
     p.body              = body
     p.pos               = pos
     p.dir               = wp.vec3(0.0, 0.0, 1.0)
-    p.max_thrust        = thrust * rho * rps_sq * diam ** 4
-    p.max_torque        = power  * rho * rps_sq * diam ** 5 / wp.TAU
+    p.kt                = CF_KT
+    p.kd                = CF_KD
     p.turning_direction = turning_direction
     return p
 
@@ -224,7 +244,7 @@ def _quat_to_rotmat(q: np.ndarray) -> np.ndarray:
 # ── Gymnasium Environment ─────────────────────────────────────────────────
 
 class DroneEnv(gymnasium.Env):
-    """Newton quadrotor — observation / action design from Eschmann et al. 2024."""
+    """Newton quadrotor — Crazyflie 2.x physics, Level-5.1 RPM control (Eschmann 2024)."""
 
     metadata = {"render_modes": ["human"], "render_fps": FPS}
 
@@ -259,7 +279,7 @@ class DroneEnv(gymnasium.Env):
         self._target      = TARGETS[0].copy()
         self._arrived     = False
         self._prev_action = np.zeros(4, dtype=np.float32)
-        self._motor_fracs = np.full(4, HOVER_FRAC, dtype=np.float32)
+        self._motor_rpms  = np.full(4, CF_HOVER_RPM, dtype=np.float32)
 
         # Public: readable by training callbacks
         self.last_dist    = 1.0
@@ -268,41 +288,51 @@ class DroneEnv(gymnasium.Env):
     # ── Build simulation ──────────────────────────────────────────────────
 
     def _build_sim(self) -> None:
-        s = DRONE_SIZE
+        al = CF_ARM   # arm length for propeller positions
+
         builder = newton.ModelBuilder()
         builder.rigid_gap = 0.05
-        builder.add_ground_plane()  
+        builder.add_ground_plane()
 
+        # Body: explicit Crazyflie mass + inertia tensor (Förster 2015).
+        # Thin cross-arm geometry is collision-only (density=0).
         body = builder.add_body(
             xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+            mass=CF_MASS,
+            inertia=wp.mat33(
+                CF_IXX, 0.0,    0.0,
+                0.0,    CF_IYY, 0.0,
+                0.0,    0.0,    CF_IZZ,
+            ),
             label="drone",
         )
-        density = 1750.0
-        for hx, hy, hz in [(s*0.05, s, s*0.05), (s, s*0.05, s*0.05)]:
+        # Collision geometry: cross arms scaled to real CF proportions (density=0
+        # so they contribute no additional mass/inertia beyond what's set above).
+        for hx, hy, hz in [(al * 0.05, al, al * 0.05), (al, al * 0.05, al * 0.05)]:
             builder.add_shape_box(
                 body, hx=hx, hy=hy, hz=hz,
-                cfg=newton.ModelBuilder.ShapeConfig(density=density),
+                cfg=newton.ModelBuilder.ShapeConfig(density=0.0),
             )
 
         self._props = wp.array([
-            _make_prop(body, wp.vec3( 0.0,  s, 0.0), turning_direction=-1.0),
-            _make_prop(body, wp.vec3( 0.0, -s, 0.0), turning_direction= 1.0),
-            _make_prop(body, wp.vec3( s,  0.0, 0.0), turning_direction= 1.0),
-            _make_prop(body, wp.vec3(-s,  0.0, 0.0), turning_direction=-1.0),
+            _make_prop(body, wp.vec3( 0.0,  al, 0.0), turning_direction=-1.0),
+            _make_prop(body, wp.vec3( 0.0, -al, 0.0), turning_direction= 1.0),
+            _make_prop(body, wp.vec3( al,  0.0, 0.0), turning_direction= 1.0),
+            _make_prop(body, wp.vec3(-al,  0.0, 0.0), turning_direction=-1.0),
         ], dtype=Propeller)
 
         self._model           = builder.finalize(requires_grad=False)
         self._solver          = newton.solvers.SolverSemiImplicit(self._model)
         self._state           = self._model.state()
         self._state1          = self._model.state()
-        self._motor_fracs_gpu = wp.zeros(4, dtype=float)
+        self._motor_rpms_gpu  = wp.zeros(4, dtype=float)
 
         if self._viewer is not None:
             self._viewer.set_model(self._model)
             self._setup_drone_mesh()
 
     def _setup_drone_mesh(self) -> None:
-        mesh = _load_crazyflie_mesh(DRONE_SIZE)
+        mesh = _load_crazyflie_mesh(CF_ARM)
         if mesh is None:
             self._has_drone_mesh = False
             return
@@ -343,7 +373,7 @@ class DroneEnv(gymnasium.Env):
         self._render_t    = 0.0
         self._arrived     = False
         self._prev_action = np.zeros(4, dtype=np.float32)
-        self._motor_fracs = np.full(4, HOVER_FRAC, dtype=np.float32)
+        self._motor_rpms  = np.full(4, CF_HOVER_RPM, dtype=np.float32)
 
         if self._random_targets:
             self._target = TARGETS[self.np_random.integers(len(TARGETS))].copy()
@@ -366,7 +396,6 @@ class DroneEnv(gymnasium.Env):
         )
         self._state.body_q.assign([init_pos])
 
-        # Small random initial velocity for curriculum robustness
         v0 = self.np_random.uniform(-vel_range, vel_range, 6).astype(np.float32)
         self._state.body_qd.assign([v0])
 
@@ -378,59 +407,62 @@ class DroneEnv(gymnasium.Env):
     # ── Gymnasium step ────────────────────────────────────────────────────
 
     def step(self, action: np.ndarray):
-        # Motor setpoint (hover-centred) → first-order LPF
-        setpoint = np.clip(
-            HOVER_FRAC + np.clip(action, -1.0, 1.0) * THRUST_RANGE,
-            0.05, 1.0,
+        # Action ∈ [-1, 1] → RPM setpoint (hover-centred, Level 5.1)
+        rpm_sp = np.clip(
+            CF_HOVER_RPM + np.clip(action, -1.0, 1.0) * CF_RPM_RANGE,
+            CF_MIN_RPM, CF_MAX_RPM,
         ).astype(np.float32)
-        self._motor_fracs = (
-            (1.0 - MOTOR_ALPHA) * self._motor_fracs + MOTOR_ALPHA * setpoint
+
+        # First-order LPF on motor RPMs (τ = 0.15 s, paper §IV)
+        self._motor_rpms = (
+            (1.0 - MOTOR_ALPHA) * self._motor_rpms + MOTOR_ALPHA * rpm_sp
         ).astype(np.float32)
 
         # Physics step
         self._state.clear_forces()
-        self._motor_fracs_gpu.assign(self._motor_fracs)
+        self._motor_rpms_gpu.assign(self._motor_rpms)
         wp.launch(
             _apply_prop_forces, dim=4,
-            inputs =(self._props, self._motor_fracs_gpu,
+            inputs =(self._props, self._motor_rpms_gpu,
                      self._state.body_q, self._model.body_com),
             outputs=(self._state.body_f,),
         )
         self._solver.step(self._state, self._state1, None, None, SIM_DT)
         self._state, self._state1 = self._state1, self._state
 
-        # Action stored BEFORE get_obs so it appears in the next obs
+        prev_action       = self._prev_action.copy()
         self._prev_action = action.astype(np.float32)
 
-        obs    = self._get_obs()
-        p_err  = obs[0:3]
-        quat   = self._state.body_q.numpy()[0][3:].astype(np.float32)
+        obs     = self._get_obs()
+        p_err   = obs[0:3]
+        quat    = self._state.body_q.numpy()[0][3:].astype(np.float32)
         body_qd = self._state.body_qd.numpy()[0].astype(np.float32)
-        v      = body_qd[3:]
-        w      = body_qd[:3]
-        z      = float(self._state.body_q.numpy()[0][2])
+        v       = body_qd[3:]
+        w       = body_qd[:3]
+        z       = float(self._state.body_q.numpy()[0][2])
 
-        dist    = float(np.linalg.norm(p_err))
-        qw      = float(quat[3])
-        R22     = float(1.0 - 2.0 * (quat[0]**2 + quat[1]**2))  # drone_up_z
+        dist = float(np.linalg.norm(p_err))
+        qw   = float(quat[3])
+        R22  = float(1.0 - 2.0 * (quat[0]**2 + quat[1]**2))  # drone_up · world_z
 
         # ── Reward (paper Eq. 1) ──────────────────────────────────────────
-        c = float(self.curriculum)
+        c    = float(self.curriculum)
         C_rp = _C_RP_INIT + c * (_C_RP_TGT - _C_RP_INIT)
         C_rv = _C_RV_INIT + c * (_C_RV_TGT - _C_RV_INIT)
         C_rw = _C_RW_INIT + c * (_C_RW_TGT - _C_RW_INIT)
         C_ra = _C_RA_INIT + c * (_C_RA_TGT - _C_RA_INIT)
 
-        pos_c    = -C_rp  * float(np.dot(p_err, p_err))
+        delta_a  = action - prev_action
+
+        pos_c    = -C_rp  * float(np.dot(p_err,    p_err))
         orient_c = -_C_RQ * float(1.0 - qw**2)
-        vel_c    = -C_rv  * float(np.dot(v, v))
-        ang_c    = -C_rw  * float(np.dot(w, w))
-        act_c    = -C_ra  * float(np.dot(action, action))
+        vel_c    = -C_rv  * float(np.dot(v,         v))
+        ang_c    = -C_rw  * float(np.dot(w,         w))
+        act_c    = -C_ra  * float(np.dot(delta_a,   delta_a))
         survival =  _C_RS
 
         crash = -2.0 if z < 0.05 else 0.0
 
-        # One-time arrival bonus (not in paper, helps with sparse-reward early training)
         arrival = 0.0
         if dist < 0.1 and not self._arrived:
             arrival = 1.0
@@ -456,6 +488,7 @@ class DroneEnv(gymnasium.Env):
             "dist":    dist,
             "upright": R22,
             "z":       z,
+            "motor_rpms": self._motor_rpms.tolist(),
             "reward_components": {
                 "pos_c":    pos_c,
                 "orient_c": orient_c,

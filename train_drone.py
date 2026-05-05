@@ -9,16 +9,16 @@
 #   tensorboard --logdir drone_logs
 #
 # Usage:
-#   python train_drone.py --algo ppo
+#   python train_drone.py --algo td3                        # paper default
 #   python train_drone.py --algo sac
-#   python train_drone.py --algo td3
-#   python train_drone.py --algo sac --headless           # no OpenGL (newton flag)
-#   python train_drone.py --algo sac --obs_noise         # sensor noise
-#   python train_drone.py --algo sac --total_timesteps 3000000
+#   python train_drone.py --algo ppo
+#   python train_drone.py --algo td3 --headless             # no OpenGL
+#   python train_drone.py --algo td3 --obs_noise            # sensor noise
+#   python train_drone.py --algo td3 --total_timesteps 3000000
 #
+# TD3  → sbx (off-policy, JAX, paper algorithm — direct RPM control)
+# SAC  → sbx (off-policy, JAX, automatic entropy regularisation)
 # PPO  → stable_baselines3 (on-policy, parallel rollouts)
-# SAC  → sbx (off-policy, JAX-accelerated, entropy regularisation)
-# TD3  → sbx (off-policy, JAX-accelerated, delayed policy update)
 ###########################################################################
 
 import os
@@ -34,32 +34,55 @@ import warp as wp
 import newton
 import newton.examples
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+from stable_baselines3.common.noise import NormalActionNoise
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from drone_gym_env import (
-    DroneEnv, MAX_EPISODE_STEPS, FPS, SIM_DT, DRONE_SIZE,
+    DroneEnv, MAX_EPISODE_STEPS, FPS, SIM_DT,
+    CF_ARM, CF_HOVER_RPM,
     _CRAZYFLIE_MESH_NAME, _load_crazyflie_mesh,
 )
 
+# Visual size for the fallback box when no CF mesh is available.
+# CF_ARM (32.5 mm) is too small to see; scale up for rendering only.
+_VIZ_SIZE = CF_ARM * 4.0   # ≈ 0.13 m — visible at training camera distance
 
-# ── Curriculum callback ───────────────────────────────────────────────────
+
+# ── Curriculum + noise-decay callback ────────────────────────────────────
 
 class CurriculumCallback(BaseCallback):
-    """Linearly ramps env.curriculum from 0 → 1 over the first half of training.
+    """Linearly ramps env.curriculum 0→1 over the first half of training.
 
-    With curriculum=0 (early): small penalty weights let the drone survive
-    even when far from the target.  As it learns to fly, weights increase,
-    demanding tighter position and velocity control.
+    Also decays TD3/SAC action noise from noise_init → noise_final over the
+    same window, matching the paper's exploration-noise decay schedule.
     """
 
-    def __init__(self, total_timesteps: int, verbose: int = 0):
+    def __init__(
+        self,
+        total_timesteps: int,
+        noise_init:  float = 0.30,   # σ at training start
+        noise_final: float = 0.05,   # σ after curriculum is fully ramped
+        verbose: int = 0,
+    ):
         super().__init__(verbose)
-        self._total = total_timesteps
+        self._total       = total_timesteps
+        self._noise_init  = noise_init
+        self._noise_final = noise_final
 
     def _on_step(self) -> bool:
         t = min(self.num_timesteps / (self._total * 0.5), 1.0)
+
+        # Update curriculum in every training environment
         for env in self.training_env.envs:
             env.curriculum = t
+
+        # Decay action noise for TD3 (and SAC if it has explicit noise)
+        if hasattr(self.model, "action_noise") and self.model.action_noise is not None:
+            sigma = self._noise_init + t * (self._noise_final - self._noise_init)
+            self.model.action_noise._sigma = np.full(
+                self.model.action_space.shape, sigma, dtype=np.float32
+            )
+
         return True
 
 
@@ -81,7 +104,7 @@ class RenderCallback(BaseCallback):
         self._grid_cols = max(1, math.ceil(math.sqrt(n)))
         self._has_drone_mesh = False
         if viewer is not None:
-            mesh = _load_crazyflie_mesh(DRONE_SIZE)
+            mesh = _load_crazyflie_mesh(CF_ARM)
             if mesh is not None:
                 points, indices, normals = mesh
                 viewer.log_mesh(_CRAZYFLIE_MESH_NAME, points, indices, normals=normals)
@@ -136,7 +159,7 @@ class RenderCallback(BaseCallback):
             else:
                 self._viewer.log_shapes(
                     "/train/drones", newton.GeoType.BOX,
-                    (DRONE_SIZE, DRONE_SIZE, DRONE_SIZE * 0.08),
+                    (_VIZ_SIZE, _VIZ_SIZE, _VIZ_SIZE * 0.25),
                     wp.array(drone_tfs,    dtype=wp.transform),
                     wp.array(drone_colors, dtype=wp.vec3),
                 )
@@ -151,8 +174,10 @@ class RenderCallback(BaseCallback):
 
         if self.verbose >= 1:
             dists = [e.last_dist for e in envs]
+            currs = [e.curriculum for e in envs]
             print(f"[render @ {self.num_timesteps:>8,}]  "
-                  f"mean_dist={np.mean(dists):.3f}  min_dist={np.min(dists):.3f}")
+                  f"mean_dist={np.mean(dists):.3f}  min_dist={np.min(dists):.3f}  "
+                  f"curriculum={currs[0]:.2f}")
 
 
 # ── Metrics callback ──────────────────────────────────────────────────────
@@ -171,6 +196,7 @@ class MetricsCallback(BaseCallback):
         self._ep_lens    = deque(maxlen=window)
         self._ep_rewards = deque(maxlen=window)
         self._successes  = deque(maxlen=window)
+        self._mean_rpms  = deque(maxlen=window)
         self._rc: dict[str, deque] = {k: deque(maxlen=window) for k in self._RC_KEYS}
 
     def _on_step(self) -> bool:
@@ -186,6 +212,9 @@ class MetricsCallback(BaseCallback):
                 v = info.get("reward_components", {}).get(k)
                 if v is not None:
                     self._rc[k].append(v)
+            rpms = info.get("motor_rpms")
+            if rpms is not None:
+                self._mean_rpms.append(float(np.mean(rpms)))
 
         if self.num_timesteps - self._last_log >= self.log_freq and self._dists:
             self._last_log = self.num_timesteps
@@ -199,6 +228,10 @@ class MetricsCallback(BaseCallback):
         rec("metrics/terminal_upright", np.mean(self._uprights))
         rec("metrics/ep_length",        np.mean(self._ep_lens))
         rec("metrics/ep_reward",        np.mean(self._ep_rewards))
+        if self._mean_rpms:
+            rec("metrics/mean_motor_rpm",   np.mean(self._mean_rpms))
+            # Hover deviation: how far motors are from hover RPM on average
+            rec("metrics/rpm_hover_dev",    abs(np.mean(self._mean_rpms) - CF_HOVER_RPM))
         for k, buf in self._rc.items():
             if buf:
                 rec(f"reward_components/{k}", np.mean(buf))
@@ -208,11 +241,11 @@ class MetricsCallback(BaseCallback):
 
 def main() -> None:
     parser = newton.examples.create_parser()
-    parser.add_argument("--algo",            type=str,   default="sac",
+    parser.add_argument("--algo",            type=str,   default="td3",
                         choices=["ppo", "sac", "td3"],
-                        help="RL algorithm to train.")
+                        help="RL algorithm (td3 matches the paper).")
     parser.add_argument("--num_envs",        type=int,   default=16)
-    parser.add_argument("--total_timesteps", type=int,   default=1_500_000)
+    parser.add_argument("--total_timesteps", type=int,   default=3_000_000)
     parser.add_argument("--checkpoint_freq", type=int,   default=50_000)
     parser.add_argument("--render_freq",     type=int,   default=5_000)
     parser.add_argument("--checkpoint_dir",  type=str,   default="checkpoints")
@@ -224,7 +257,6 @@ def main() -> None:
                         help="Disable reward curriculum (fixed target weights).")
 
     viewer, args = newton.examples.init(parser)
-    # viewer is already None when --headless or --viewer null is passed by newton
 
     algo = args.algo.lower()
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -268,7 +300,7 @@ def main() -> None:
             learning_rate=args.learning_rate,
             buffer_size=500_000,
             batch_size=256,
-            learning_starts=5_000,
+            learning_starts=10_000,
             gamma=args.gamma,
             tau=0.005,
             ent_coef="auto",
@@ -278,19 +310,29 @@ def main() -> None:
             policy_kwargs=dict(net_arch=[256, 256]),
             tensorboard_log=tb_log,
         )
-    else:  # td3
+    else:  # td3 — matches paper (Eschmann 2024)
         from sbx import TD3
+        # Exploration noise in normalised action space [-1, 1].
+        # CurriculumCallback decays σ from 0.30 → 0.05 as the policy matures.
+        action_noise = NormalActionNoise(
+            mean=np.zeros(train_env.action_space.shape),
+            sigma=0.30 * np.ones(train_env.action_space.shape),
+        )
         model = TD3(
             "MlpPolicy", train_env,
             verbose=1,
             learning_rate=args.learning_rate,
             buffer_size=500_000,
             batch_size=256,
-            learning_starts=5_000,
+            learning_starts=10_000,
             gamma=args.gamma,
             tau=0.005,
             train_freq=1,
             gradient_steps=1,
+            action_noise=action_noise,
+            policy_delay=2,
+            target_policy_noise=0.2,
+            target_noise_clip=0.5,
             policy_kwargs=dict(net_arch=[256, 256]),
             tensorboard_log=tb_log,
         )
@@ -300,7 +342,7 @@ def main() -> None:
         CheckpointCallback(
             save_freq=max(args.checkpoint_freq // args.num_envs, 1),
             save_path=args.checkpoint_dir,
-            name_prefix=f"{algo}_drone",
+            name_prefix=f"{algo}_hover",
             verbose=1,
         ),
         RenderCallback(
@@ -312,12 +354,17 @@ def main() -> None:
         MetricsCallback(log_freq=1_000, window=100),
     ]
     if not args.no_curriculum:
-        callbacks.append(CurriculumCallback(args.total_timesteps))
+        callbacks.append(CurriculumCallback(
+            total_timesteps=args.total_timesteps,
+            noise_init=0.30,
+            noise_final=0.05,
+        ))
 
     print(
         f"\n  algo={algo.upper()}  steps={args.total_timesteps:,}  "
-        f"envs={args.num_envs}  viewer={'off' if viewer is None else 'on'}  "
-        f"obs_noise={args.obs_noise}  curriculum={not args.no_curriculum}\n"
+        f"envs={args.num_envs}  viewer={'off' if viewer is None else 'on'}\n"
+        f"  obs_noise={args.obs_noise}  curriculum={not args.no_curriculum}\n"
+        f"  CF mass=27g  arm=32.5mm  hover≈{CF_HOVER_RPM:.0f} RPM  action=Level-5.1 RPM\n"
         f"  checkpoints → {args.checkpoint_dir}/\n"
         f"  TensorBoard → tensorboard --logdir drone_logs\n"
     )
@@ -325,7 +372,7 @@ def main() -> None:
     model.learn(
         total_timesteps=args.total_timesteps,
         callback=callbacks,
-        tb_log_name=algo,   # creates drone_logs/sac_1/, drone_logs/ppo_1/, etc.
+        tb_log_name=algo,
         progress_bar=True,
     )
 

@@ -23,7 +23,7 @@ import numpy as np
 
 import newton.examples
 from stable_baselines3 import PPO
-from drone_landing_env import DroneLandingEnv, LAND_DIST, LAND_SPEED, MAX_EPISODE_STEPS
+from landing.drone_landing_env import DroneLandingEnv, LAND_DIST, LAND_SPEED, MAX_EPISODE_STEPS
 
 
 # ── Evaluation loop ───────────────────────────────────────────────────────

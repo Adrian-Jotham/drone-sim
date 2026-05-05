@@ -41,7 +41,7 @@ import warp as wp
 import newton
 import newton.solvers
 
-from drone_gym_env import (
+from disturbance.quadrotor_hover_env import (
     Propeller,
     _apply_prop_forces,
     _make_prop,
