@@ -185,7 +185,7 @@ class RenderCallback(BaseCallback):
 class MetricsCallback(BaseCallback):
     """Logs per-episode metrics and reward components to TensorBoard."""
 
-    _RC_KEYS = ("pos_c", "orient_c", "vel_c", "ang_c", "act_c", "survival")
+    _RC_KEYS = ("pos_c", "orient_c", "vel_c", "ang_c", "act_c", "survival", "approach", "hover_bonus")
 
     def __init__(self, log_freq: int = 1_000, window: int = 100, verbose: int = 0):
         super().__init__(verbose)
@@ -246,7 +246,7 @@ def main() -> None:
                         help="RL algorithm (td3 matches the paper).")
     parser.add_argument("--num_envs",        type=int,   default=16)
     parser.add_argument("--total_timesteps", type=int,   default=3_000_000)
-    parser.add_argument("--checkpoint_freq", type=int,   default=50_000)
+    parser.add_argument("--checkpoint_freq", type=int,   default=500_000)
     parser.add_argument("--render_freq",     type=int,   default=5_000)
     parser.add_argument("--checkpoint_dir",  type=str,   default="checkpoints")
     parser.add_argument("--learning_rate",   type=float, default=3e-4)
@@ -289,22 +289,27 @@ def main() -> None:
             gamma=args.gamma,
             gae_lambda=0.95,
             clip_range=0.2,
+            ent_coef=0.005,     # small entropy bonus keeps exploration alive
+            vf_coef=0.5,
+            max_grad_norm=0.5,
             policy_kwargs=dict(net_arch=[256, 256]),
+            # device="cpu",       # SB3 MLP policy is faster on CPU than GPU
             tensorboard_log=tb_log,
         )
     elif algo == "sac":
         from sbx import SAC
+        # ent_coef="auto" defaults to target_entropy=-4 (too stochastic for
+        # RPM control — causes crashes and reward divergence). Fix it small.
         model = SAC(
             "MlpPolicy", train_env,
             verbose=1,
             learning_rate=args.learning_rate,
             buffer_size=500_000,
             batch_size=256,
-            learning_starts=10_000,
+            learning_starts=1_000,  # start learning quickly so policy stays near hover
             gamma=args.gamma,
             tau=0.005,
-            ent_coef="auto",
-            target_entropy="auto",
+            ent_coef=0.005,         # fixed small entropy — don't let SAC thrash RPMs
             train_freq=1,
             gradient_steps=1,
             policy_kwargs=dict(net_arch=[256, 256]),
@@ -312,11 +317,13 @@ def main() -> None:
         )
     else:  # td3 — matches paper (Eschmann 2024)
         from sbx import TD3
-        # Exploration noise in normalised action space [-1, 1].
-        # CurriculumCallback decays σ from 0.30 → 0.05 as the policy matures.
+        # Start with small noise (σ=0.10) so the initial near-zero policy
+        # stays close to hover. CurriculumCallback decays to σ=0.02.
+        # Do NOT use learning_starts: random uniform actions in [-1,1] fill
+        # the buffer with crashes; policy-driven exploration from step 0 is safer.
         action_noise = NormalActionNoise(
             mean=np.zeros(train_env.action_space.shape),
-            sigma=0.30 * np.ones(train_env.action_space.shape),
+            sigma=0.10 * np.ones(train_env.action_space.shape),
         )
         model = TD3(
             "MlpPolicy", train_env,
@@ -324,7 +331,7 @@ def main() -> None:
             learning_rate=args.learning_rate,
             buffer_size=500_000,
             batch_size=256,
-            learning_starts=10_000,
+            learning_starts=0,
             gamma=args.gamma,
             tau=0.005,
             train_freq=1,
@@ -354,10 +361,12 @@ def main() -> None:
         MetricsCallback(log_freq=1_000, window=100),
     ]
     if not args.no_curriculum:
+        # TD3: decay from 0.10 → 0.02  (small range avoids crash-filling the buffer)
+        # SAC/PPO: noise_* ignored (SAC has no external noise; PPO ignores it)
         callbacks.append(CurriculumCallback(
             total_timesteps=args.total_timesteps,
-            noise_init=0.30,
-            noise_final=0.05,
+            noise_init=0.10,
+            noise_final=0.02,
         ))
 
     print(

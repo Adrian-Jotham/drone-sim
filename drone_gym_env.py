@@ -125,7 +125,7 @@ def _load_crazyflie_mesh(arm_length: float):
 
 FPS               = 100          # Hz — matches paper's simulator frequency
 SIM_DT            = 1.0 / FPS
-MAX_EPISODE_STEPS = 500          # 5 s at 100 Hz
+MAX_EPISODE_STEPS = 800          # 8 s — matches eval budget (4 wp × 200 steps)
 
 # ── Crazyflie 2.x physical parameters ────────────────────────────────────
 # Sources: Förster 2015 (ETH system ID), Bitcraze documentation, Eschmann 2024
@@ -162,13 +162,24 @@ MOTOR_ALPHA = SIM_DT / MOTOR_TAU   # ≈ 0.067 per step
 N_ACTION_HIST = 1
 OBS_DIM       = 3 + 9 + 3 + 3 + N_ACTION_HIST * 4   # 22
 
-# Training waypoints
+# Fixed waypoints used when random_targets=False (eval / render)
 TARGETS = [
     np.array([ 1.0,  0.0, 0.5], dtype=np.float32),
     np.array([ 0.0,  1.0, 0.5], dtype=np.float32),
     np.array([-1.0,  0.0, 0.5], dtype=np.float32),
     np.array([ 0.0, -1.0, 0.5], dtype=np.float32),
 ]
+
+def _sample_random_target(rng: np.random.Generator) -> np.ndarray:
+    """Sample a random target from the same distribution as the evaluator.
+
+    radius ∈ [0.5, 1.5] m,  altitude ∈ [0.3, 1.2] m,  angle ∈ [0, 2π)
+    Matching eval_drone.py so the training distribution covers the eval range.
+    """
+    angle  = rng.uniform(0.0, 2.0 * np.pi)
+    radius = rng.uniform(0.5, 1.5)
+    alt    = rng.uniform(0.3, 1.2)
+    return np.array([radius * np.cos(angle), radius * np.sin(angle), alt], dtype=np.float32)
 
 # ── Reward weight curriculum ──────────────────────────────────────────────
 # env.curriculum ∈ [0,1]: 0 = init (easy), 1 = target (hard).
@@ -180,6 +191,12 @@ _C_RA_INIT, _C_RA_TGT = 0.005, 0.02  # action-change regularisation ‖Δa‖²
 
 _C_RQ = 0.10   # orientation cost  (1 − qw²)  — fixed
 _C_RS = 0.50   # survival bonus per step       — fixed
+
+# Approach / hover shaping constants
+_APPROACH_COEF      = 1.0   # potential-shaping weight (was 2.0 — reduced to curb overshoot)
+_APPROACH_GATE      = 0.25  # m — suppress approach reward inside this radius to stop oscillation
+_HOVER_BONUS        = 0.15  # per-step bonus for settling at target (halved from 0.30)
+_HOVER_SPEED_GATE   = 0.5   # m/s — must be slow to earn hover bonus; stops rush-to-target
 
 
 # ── Propeller physics (Level 5.1 — direct RPM) ───────────────────────────
@@ -376,13 +393,16 @@ class DroneEnv(gymnasium.Env):
         self._motor_rpms  = np.full(4, CF_HOVER_RPM, dtype=np.float32)
 
         if self._random_targets:
-            self._target = TARGETS[self.np_random.integers(len(TARGETS))].copy()
+            self._target = _sample_random_target(self.np_random)
         else:
             self._target = TARGETS[0].copy()
 
-        # Initial position randomisation scales with curriculum (easy → hard)
-        pos_range = 0.1 + 0.4 * self.curriculum   # 0.1 m → 0.5 m
-        vel_range = 0.3 * self.curriculum           # 0 → 0.3 m/s
+        # Spawn range grows with curriculum. Cap at 0.7 m so that the
+        # survival bonus (+0.5/step) always exceeds the position penalty
+        # (-C_rp × dist²) at spawn, keeping episode returns positive and
+        # giving PPO a learnable gradient from the first update.
+        pos_range = 0.1 + 0.6 * self.curriculum   # 0.1 m → 0.7 m
+        vel_range = 0.5 * self.curriculum           # 0 → 0.5 m/s
 
         xy  = self.np_random.uniform(-pos_range, pos_range, 2).astype(np.float32)
         dz  = float(self.np_random.uniform(-pos_range * 0.5, pos_range * 0.5))
@@ -468,7 +488,20 @@ class DroneEnv(gymnasium.Env):
             arrival = 1.0
             self._arrived = True
 
-        reward = pos_c + orient_c + vel_c + ang_c + act_c + survival + crash + arrival
+        # Potential-based shaping: only active far from target so the drone
+        # doesn't oscillate trying to generate approach reward near the waypoint.
+        approach = (
+            _APPROACH_COEF * (self.last_dist - dist)
+            if dist > _APPROACH_GATE else 0.0
+        )
+
+        # Dense bonus for settling at the target.
+        # Gated on speed so the policy must decelerate before earning it —
+        # a pure distance gate rewards rushing through the target at high speed.
+        speed = float(np.linalg.norm(v))
+        hover_bonus = _HOVER_BONUS if (dist < 0.15 and speed < _HOVER_SPEED_GATE) else 0.0
+
+        reward = pos_c + orient_c + vel_c + ang_c + act_c + survival + crash + arrival + approach + hover_bonus
 
         # ── Termination ───────────────────────────────────────────────────
         terminated = bool(
@@ -490,12 +523,14 @@ class DroneEnv(gymnasium.Env):
             "z":       z,
             "motor_rpms": self._motor_rpms.tolist(),
             "reward_components": {
-                "pos_c":    pos_c,
-                "orient_c": orient_c,
-                "vel_c":    vel_c,
-                "ang_c":    ang_c,
-                "act_c":    act_c,
-                "survival": survival,
+                "pos_c":      pos_c,
+                "orient_c":   orient_c,
+                "vel_c":      vel_c,
+                "ang_c":      ang_c,
+                "act_c":      act_c,
+                "survival":   survival,
+                "approach":   approach,
+                "hover_bonus": hover_bonus,
             },
         }
         if terminated or truncated:

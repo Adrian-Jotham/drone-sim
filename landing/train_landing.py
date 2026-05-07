@@ -33,7 +33,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from drone_landing_env import (
+from landing.drone_landing_env import (
     DroneLandingEnv,
     MAX_EPISODE_STEPS,
     FPS,
