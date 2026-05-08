@@ -245,7 +245,7 @@ def main() -> None:
                         choices=["ppo", "sac", "td3"],
                         help="RL algorithm (td3 matches the paper).")
     parser.add_argument("--num_envs",        type=int,   default=16)
-    parser.add_argument("--total_timesteps", type=int,   default=3_000_000)
+    parser.add_argument("--total_timesteps", type=int,   default=6_000_000)
     parser.add_argument("--checkpoint_freq", type=int,   default=500_000)
     parser.add_argument("--render_freq",     type=int,   default=5_000)
     parser.add_argument("--checkpoint_dir",  type=str,   default="checkpoints")
