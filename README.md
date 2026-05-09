@@ -44,16 +44,23 @@ python train_drone.py --algo td3
 # Headless (no OpenGL window)
 python train_drone.py --algo td3 --headless
 
-# Compare all three algorithms
-python train_drone.py --algo ppo --headless
-python train_drone.py --algo sac --headless
-python train_drone.py --algo td3 --headless
+# Long run (10 M steps) with early stop at 80 % success and LR decay
+python train_drone.py --algo ppo --headless \
+  --total_timesteps 10_000_000 \
+  --curriculum_steps 1_500_000 \
+  --target_success 0.8 \
+  --lr_final 5e-5
+
+# Resume from a checkpoint
+python train_drone.py --algo ppo --headless \
+  --resume checkpoints/ppo_s0_3000000_steps \
+  --total_timesteps 10_000_000
 
 # Monitor training
 tensorboard --logdir drone_logs
 
 # Evaluate a trained model
-python eval_drone.py --model td3_drone_final --algo td3
+python eval_drone.py --model ppo_drone_final --algo ppo
 ```
 
 ---
@@ -276,7 +283,7 @@ ang_c    = -C_rω  * ‖ω‖²
 act_c    = -C_ra  * ‖Δa‖²
 survival = +0.50                             # every step
 crash    = -2.00  if z < 0.05 m             # one-time ground impact
-arrival  = +1.00  first time dist < 0.10 m  # one-time per waypoint
+arrival  = +15.00 first time dist < 0.15 m  # one-time per waypoint
 approach = _APPROACH_COEF × (last_dist − dist)  if dist > 0.25 m  else 0.0
 hover_bonus = +0.15  if dist < 0.15 m AND speed < 0.5 m/s  # settled at target
 ```
@@ -419,10 +426,21 @@ visible in `ep_length` (shorter episodes) and `terminal_upright` (near 0 if cras
 
 ### arrival — One-time waypoint bonus
 
-**Code:** `drone_gym_env.py` — `arrival = 1.0` first time `dist < 0.10 m`
+**Code:** `drone_gym_env.py` — `arrival = 15.0` first time `dist < 0.15 m`
 
-A `+1.0` bonus the first time the drone comes within 0.10 m of the current waypoint.
+A `+15.0` bonus the first time the drone comes within 0.15 m of the current waypoint.
 The flag `self._arrived` prevents repeated claiming on the same target.
+
+**Why 15.0:** Over an 800-step episode the survival bonus accumulates +400 total.
+A `+1.0` arrival signal (the previous value) was 0.25 % of episode reward — too small
+for PPO to reliably credit the approach actions that led to it. At `+15.0` the arrival
+is equivalent to 30 steps of survival bonus, making target-reaching clearly the most
+valuable single event per episode.
+
+**Why 0.15 m threshold:** Aligns the training bonus with the evaluation success
+criterion (`dist < 0.15 m`) and with `hover_bonus`. Previously the arrival fired at
+0.10 m while success was measured at 0.15 m — the drone could count as a training
+success without ever receiving the arrival signal.
 
 **What it drives:** Provides a salient one-time signal that clearly marks "you found
 the target". The `hover_bonus` (below) then takes over to reward staying there.
@@ -530,7 +548,8 @@ the initial random policy.
 
 ```python
 # train_drone.py — CurriculumCallback._on_step()
-curriculum = min(num_timesteps / (total_timesteps × 0.5), 1.0)
+curriculum = min(num_timesteps / curriculum_steps, 1.0)
+# curriculum_steps default: 1_500_000  (fixed absolute count, see --curriculum_steps)
 ```
 
 Disable with `--no_curriculum` for ablation experiments.
@@ -638,13 +657,59 @@ python train_drone.py --algo td3 --headless --total_timesteps 3000000
 | `--algo` | `td3` | Algorithm: `ppo`, `sac`, or `td3` |
 | `--num_envs` | `16` | Parallel training environments |
 | `--total_timesteps` | `3 000 000` | Total environment steps |
-| `--learning_rate` | `3e-4` | Adam learning rate |
+| `--curriculum_steps` | `1 500 000` | Steps over which curriculum ramps 0→1. Fixed absolute count, decoupled from `--total_timesteps` so extending a run does not slow the ramp. |
+| `--target_success` | `1.0` | Early-stop when rolling 100-episode success rate exceeds this value. `1.0` = never stop early. Use `0.8` to stop automatically when the policy converges. |
+| `--lr_final` | `None` | If set, linearly decay the learning rate from `--learning_rate` down to this value over the full run. Useful for fine-tuning in long runs (e.g. `--lr_final 5e-5` for 10 M steps). |
+| `--resume` | `None` | Path to a checkpoint `.zip` to resume training from. Continues to `--total_timesteps` without resetting the step counter, LR schedule, or curriculum. |
+| `--learning_rate` | `3e-4` | Initial Adam learning rate (constant unless `--lr_final` is set) |
 | `--gamma` | `0.99` | Discount factor |
-| `--checkpoint_freq` | `50 000` | Save checkpoint every N steps |
+| `--checkpoint_freq` | `500 000` | Save checkpoint every N steps |
 | `--checkpoint_dir` | `checkpoints` | Directory for checkpoints |
 | `--obs_noise` | off | Add Gaussian sensor noise to observations |
 | `--no_curriculum` | off | Disable reward curriculum (fixed target weights) |
 | `--headless` | off | No OpenGL viewer (Newton built-in flag) |
+
+### Resuming from a checkpoint
+
+```bash
+# Resume from the 3 M step checkpoint and continue to 10 M
+python train_drone.py --algo ppo \
+  --resume checkpoints/ppo_s0_3000000_steps \
+  --total_timesteps 10_000_000 \
+  --curriculum_steps 1_500_000 \
+  --target_success 0.8 \
+  --lr_final 5e-5
+```
+
+`--resume` loads the policy weights, optimizer state, and step counter from the
+checkpoint zip. With `reset_num_timesteps=False` (set automatically), three things
+continue correctly from the saved step count:
+
+| What | Effect |
+|------|--------|
+| **Curriculum** | If `num_timesteps ≥ curriculum_steps` at load, curriculum stays at 1.0 immediately — no regression to easy tasks. |
+| **LR schedule** | `progress_remaining = 1 − done/total`. At 3 M / 10 M = 0.7, the LR is already 70 % of the way through its decay curve. |
+| **Early stop** | The rolling success window resets (correct — stale pre-resume data should not trigger the stop). |
+
+**Replay buffer note:** SAC and TD3 checkpoints do **not** include the replay buffer.
+Off-policy methods will retrain with an empty buffer for the first ~50 k steps after
+resume. PPO is unaffected (no replay buffer).
+
+### Extending a 3 M run to 10 M — what changes
+
+```bash
+# OLD (3M default — curriculum ramps over 1.5M steps):
+python train_drone.py --algo ppo --total_timesteps 3_000_000
+
+# NEW (10M — curriculum still finishes at 1.5M, not 5M):
+python train_drone.py --algo ppo \
+  --total_timesteps 10_000_000 \
+  --curriculum_steps 1_500_000
+```
+
+Without `--curriculum_steps`, the old formula `total_timesteps × 0.5` would silently
+push the curriculum endpoint to 5 M — the drone trains on easy tasks for 3.3 M extra
+steps before seeing full difficulty.
 
 ### Exploration Noise Decay (TD3)
 
@@ -941,7 +1006,7 @@ If `--headless` is passed, `viewer = None` and this callback is a no-op.
 #### MetricsCallback
 
 ```python
-MetricsCallback(log_freq=1_000, window=100)
+MetricsCallback(log_freq=1_000, window=100, target_success=args.target_success)
 ```
 
 Fires on every step. It reads `info["reward_components"]` and `info["motor_rpms"]`
@@ -951,6 +1016,13 @@ an episode finishes (`done=True`).
 
 All values are stored in `deque(maxlen=100)` rolling buffers. Every 1 000 steps it
 flushes the mean of each buffer to TensorBoard via `self.logger.record(...)`.
+
+**Early-stop:** After each TensorBoard flush, if `target_success < 1.0` and the
+rolling success deque is full (100 episodes), the callback checks whether
+`mean(successes) ≥ target_success`. If so it returns `False` from `_on_step()`,
+which signals SB3 to stop training immediately. The final model is still saved by
+the `model.save()` call in `main()`. The deque must be full before the check fires
+so a lucky early spike cannot trigger a premature stop.
 
 ```python
 # train_drone.py:202-217  — _on_step()
@@ -975,9 +1047,9 @@ them contribute to the rolling mean), while terminal metrics are only logged at
 
 ```python
 CurriculumCallback(
-    total_timesteps = 3_000_000,
-    noise_init      = 0.10,
-    noise_final     = 0.02,
+    curriculum_steps = 1_500_000,   # absolute step count, not a fraction of total
+    noise_init       = 0.10,
+    noise_final      = 0.02,
 )
 ```
 
@@ -985,16 +1057,17 @@ Fires on every step. Computes the curriculum progress `t` and writes it into
 every environment:
 
 ```python
-# train_drone.py:72-77  — _on_step()
-t = min(self.num_timesteps / (self._total * 0.5), 1.0)
+# train_drone.py — _on_step()
+t = min(self.num_timesteps / self._curriculum_steps, 1.0)
 for env in self.training_env.envs:
     env.curriculum = t
 ```
 
-`t` reaches 1.0 at **1.5 M steps** (50% of 3 M) and stays there for the rest of
-training. This means the reward weights spend the first half of training ramping from
-easy to hard, and the second half of training at full precision — giving the policy
-time to master tight hovering under the full weight regime.
+`t` reaches 1.0 at **`curriculum_steps`** (default 1 500 000) and stays there for
+the rest of training. Using an absolute step count rather than `total_timesteps × 0.5`
+means extending a run to 10 M steps does not silently push the curriculum endpoint
+to 5 M — the ramp always finishes at the same wall-clock point regardless of how
+long training runs.
 
 The `noise_init` / `noise_final` arguments only apply to TD3 (which has explicit
 action noise). For PPO the callback still fires, but the `action_noise` branch is
@@ -1016,7 +1089,7 @@ With the default settings (`--algo ppo --num_envs 16 --total_timesteps 3_000_000
 | Total gradient steps | ~466 560 |
 | Checkpoint saves | 60 (every 50k steps) |
 | TensorBoard flushes | 3 000 (every 1k steps) |
-| Curriculum fully ramped at | 1 500 000 steps (step 46 of 91 rollouts) |
+| Curriculum fully ramped at | `--curriculum_steps` (default 1 500 000 = step 46 of 91 rollouts) |
 | Estimated wall time (GPU) | ~30 min headless |
 
 ---

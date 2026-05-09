@@ -195,7 +195,7 @@ _C_RS = 0.50   # survival bonus per step       — fixed
 # Approach / hover shaping constants
 _APPROACH_COEF      = 1.0   # potential-shaping weight (was 2.0 — reduced to curb overshoot)
 # _APPROACH_COEF      = 0   # potential-shaping weight (reduced from 1.0 to curb overshoot)
-_APPROACH_GATE      = 0.25  # m — suppress approach reward inside this radius to stop oscillation
+_APPROACH_GATE      = 0.10  # m — suppress approach reward inside this radius to stop oscillation
 _HOVER_BONUS        = 0.15  # per-step bonus for settling at target (halved from 0.30)
 # _HOVER_BONUS        = 0.0   # per-step bonus for settling at target (disabled to simplify reward)
 _HOVER_SPEED_GATE   = 0.5   # m/s — must be slow to earn hover bonus; stops rush-to-target
@@ -486,8 +486,8 @@ class DroneEnv(gymnasium.Env):
         crash = -2.0 if z < 0.05 else 0.0
 
         arrival = 0.0
-        if dist < 0.1 and not self._arrived:
-            arrival = 1.0
+        if dist < 0.15 and not self._arrived:
+            arrival = 15.0
             self._arrived = True
 
         # Potential-based shaping: only active far from target so the drone
