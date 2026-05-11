@@ -272,6 +272,7 @@ class DroneEnv(gymnasium.Env):
         render_mode:    str | None = None,
         viewer         = None,
         random_targets: bool  = True,
+        multi_target:   bool  = False,
         obs_noise:      bool  = False,
         curriculum:     float = 0.0,
     ):
@@ -279,6 +280,7 @@ class DroneEnv(gymnasium.Env):
         self.render_mode     = render_mode
         self._viewer         = viewer
         self._random_targets = random_targets
+        self._multi_target   = multi_target
         self.obs_noise       = obs_noise
         self.curriculum      = float(np.clip(curriculum, 0.0, 1.0))
 
@@ -404,22 +406,40 @@ class DroneEnv(gymnasium.Env):
         # (-C_rp × dist²) at spawn, keeping episode returns positive and
         # giving PPO a learnable gradient from the first update.
         pos_range = 0.1 + 0.6 * self.curriculum   # 0.1 m → 0.7 m
-        vel_range = 0.5 * self.curriculum           # 0 → 0.5 m/s
+        lin_range = 1.5 * self.curriculum           # 0 → ±1.5 m/s linear velocity
+        ang_range = 0.5 * self.curriculum           # 0 → ±0.5 rad/s angular velocity
 
-        xy  = self.np_random.uniform(-pos_range, pos_range, 2).astype(np.float32)
-        dz  = float(self.np_random.uniform(-pos_range * 0.5, pos_range * 0.5))
+        xy     = self.np_random.uniform(-pos_range, pos_range, 2).astype(np.float32)
+        dz     = float(self.np_random.uniform(-pos_range, pos_range))   # full range, not ×0.5
         init_z = max(self._target[2] + dz, 0.15)
+
+        # Random initial roll/pitch up to ±15° at full curriculum (no yaw randomisation).
+        # Forces the policy to learn attitude stabilisation concurrent with navigation,
+        # not sequentially after spawning level.
+        max_ori = 15.0 * self.curriculum * (np.pi / 180.0)
+        if max_ori > 0.0:
+            roll  = float(self.np_random.uniform(-max_ori, max_ori))
+            pitch = float(self.np_random.uniform(-max_ori, max_ori))
+            cr, sr = np.cos(roll * 0.5), np.sin(roll * 0.5)
+            cp, sp = np.cos(pitch * 0.5), np.sin(pitch * 0.5)
+            # Quaternion for roll-then-pitch (ZYX, yaw=0): [qx, qy, qz, qw]
+            init_quat = wp.quat(float(cp * sr), float(sp * cr), float(-sp * sr), float(cp * cr))
+        else:
+            init_quat = wp.quat_identity()
 
         init_pos = wp.transform(
             wp.vec3(float(self._target[0] + xy[0]),
                     float(self._target[1] + xy[1]),
                     init_z),
-            wp.quat_identity(),
+            init_quat,
         )
         self._state.body_q.assign([init_pos])
 
-        v0 = self.np_random.uniform(-vel_range, vel_range, 6).astype(np.float32)
-        self._state.body_qd.assign([v0])
+        # Separate linear and angular velocity ranges so each axis is covered
+        # at the right physical scale (translational vs. rotational dynamics differ).
+        lin_v = self.np_random.uniform(-lin_range, lin_range, 3).astype(np.float32)
+        ang_v = self.np_random.uniform(-ang_range, ang_range, 3).astype(np.float32)
+        self._state.body_qd.assign([np.concatenate([ang_v, lin_v])])
 
         obs = self._get_obs()
         self.last_dist    = float(np.linalg.norm(obs[0:3]))
@@ -455,13 +475,15 @@ class DroneEnv(gymnasium.Env):
         prev_action       = self._prev_action.copy()
         self._prev_action = action.astype(np.float32)
 
-        obs     = self._get_obs()
-        p_err   = obs[0:3]
-        quat    = self._state.body_q.numpy()[0][3:].astype(np.float32)
-        body_qd = self._state.body_qd.numpy()[0].astype(np.float32)
-        v       = body_qd[3:]
-        w       = body_qd[:3]
-        z       = float(self._state.body_q.numpy()[0][2])
+        obs       = self._get_obs()
+        p_err     = obs[0:3]
+        body_q_np = self._state.body_q.numpy()[0].astype(np.float32)
+        pos       = body_q_np[:3]
+        quat      = body_q_np[3:]
+        body_qd   = self._state.body_qd.numpy()[0].astype(np.float32)
+        v         = body_qd[3:]
+        w         = body_qd[:3]
+        z         = float(pos[2])
 
         dist = float(np.linalg.norm(p_err))
         qw   = float(quat[3])
@@ -489,6 +511,8 @@ class DroneEnv(gymnasium.Env):
         if dist < 0.15 and not self._arrived:
             arrival = 15.0
             self._arrived = True
+            if self._multi_target and self._random_targets:
+                self.set_target(_sample_random_target(self.np_random))
 
         # Potential-based shaping: only active far from target so the drone
         # doesn't oscillate trying to generate approach reward near the waypoint.
@@ -516,7 +540,9 @@ class DroneEnv(gymnasium.Env):
         self._step_count += 1
         truncated         = self._step_count >= MAX_EPISODE_STEPS
         self._ep_reward  += reward
-        self.last_dist    = dist
+        # Recompute last_dist against the current target — handles the case where
+        # multi_target changed self._target mid-step (prevents a one-step approach spike).
+        self.last_dist    = float(np.linalg.norm(pos - self._target))
         self.last_upright = R22
 
         info: dict = {
@@ -550,8 +576,10 @@ class DroneEnv(gymnasium.Env):
 
     def set_target(self, target: np.ndarray) -> None:
         """Switch waypoint mid-episode; call get_obs() to refresh observation."""
-        self._target  = np.asarray(target, dtype=np.float32).copy()
-        self._arrived = False
+        self._target   = np.asarray(target, dtype=np.float32).copy()
+        self._arrived  = False
+        body_q         = self._state.body_q.numpy()[0]
+        self.last_dist = float(np.linalg.norm(body_q[:3].astype(np.float32) - self._target))
 
     def get_obs(self) -> np.ndarray:
         """Re-read current simulator state as observation (useful after set_target)."""

@@ -666,6 +666,7 @@ python train_drone.py --algo td3 --headless --total_timesteps 3000000
 | `--checkpoint_freq` | `500 000` | Save checkpoint every N steps |
 | `--checkpoint_dir` | `checkpoints` | Directory for checkpoints |
 | `--obs_noise` | off | Add Gaussian sensor noise to observations |
+| `--multi_target` | off | When the drone reaches a waypoint, immediately assign a new random one without physics reset. Aligns training with `eval_drone.py`'s sequential-waypoint protocol; forces the policy to learn repeated target-reaching within one episode. |
 | `--no_curriculum` | off | Disable reward curriculum (fixed target weights) |
 | `--headless` | off | No OpenGL viewer (Newton built-in flag) |
 
@@ -710,6 +711,22 @@ python train_drone.py --algo ppo \
 Without `--curriculum_steps`, the old formula `total_timesteps × 0.5` would silently
 push the curriculum endpoint to 5 M — the drone trains on easy tasks for 3.3 M extra
 steps before seeing full difficulty.
+
+### Spawn Randomisation
+
+The environment randomises the drone's initial state at every episode reset. All ranges grow linearly with the curriculum, so early training starts easy (drone is already near-hover, close to target) and full difficulty is reached at `curriculum_steps`.
+
+| Dimension | Range at `curriculum = 0` | Range at `curriculum = 1` | Why |
+|-----------|--------------------------|--------------------------|-----|
+| **Position (XY)** | ±0.1 m from target | ±0.7 m from target | Covers training distribution as difficulty ramps |
+| **Position (Z)** | ±0.1 m from target z | ±0.7 m from target z | Full vertical coverage — avoids under-training upward/downward thrust authority |
+| **Orientation (roll/pitch)** | 0° | ±15° | Forces policy to learn attitude stabilisation concurrent with navigation, not sequentially |
+| **Linear velocity** | 0 m/s | ±1.5 m/s (all axes) | Teaches braking and settling from arbitrary initial velocity |
+| **Angular velocity** | 0 rad/s | ±0.5 rad/s (body frame) | Forces the policy to damp oscillations it did not cause itself |
+
+**Orientation randomisation** is the most significant addition. Without it, the policy only encounters tilted states mid-episode as a consequence of its own aggressive manoeuvres — never as a starting condition. A drone that spawns tilted ±15° must immediately stabilise while also navigating, which is exactly the recovery scenario that leads to real-world crashes.
+
+**Separate linear and angular velocity ranges** replace the old single `vel_range = 0.5 × curriculum` scalar that mixed physically different units. Linear and angular velocities have different natural scales and independent effects on the dynamics.
 
 ### Exploration Noise Decay (TD3)
 
@@ -771,8 +788,9 @@ def _make_env():
         return DroneEnv(
             render_mode=None, viewer=None,
             random_targets=True,
+            multi_target=args.multi_target,  # ← reassign target on each reach
             obs_noise=args.obs_noise,
-            curriculum=0.0,        # ← starts easy; CurriculumCallback will ramp this
+            curriculum=0.0,                  # ← starts easy; CurriculumCallback will ramp this
         )
     return _init
 
@@ -1587,7 +1605,8 @@ CF hover ≈ 14476 RPM  |  max 21702 RPM  |  action space: Level-5.1 (direct RPM
 env = DroneEnv(
     render_mode    = "human" | None,  # "human" enables Newton viewer
     viewer         = viewer,           # Newton viewer object (or None)
-    random_targets = True,             # randomly pick from TARGETS at reset
+    random_targets = True,             # randomly sample target at each reset
+    multi_target   = False,            # reassign a new random target on each waypoint reach
     obs_noise      = False,            # add Gaussian sensor noise
     curriculum     = 0.0,             # reward weight scale [0=easy, 1=hard]
 )

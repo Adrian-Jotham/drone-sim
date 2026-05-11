@@ -16,7 +16,9 @@
 # Key differences from the paper:
 #   - No asymmetric actor-critic: critic sees the same 22-D obs as actor.
 #     (Paper critic sees 28-D: adds motor RPMs + random disturbances.)
-#   - No domain randomisation / random external disturbances.
+#   - Partial domain randomisation: spawn pos/vel/angular-rate via curriculum;
+#     optional spawn orientation (roll/pitch ±15°) and multi-waypoint training.
+#     No external disturbance forces.
 #   - RLtools → sbx (JAX) for TD3/SAC; SB3 for PPO.
 #
 # Usage:
@@ -281,7 +283,7 @@ def main() -> None:
                         help="RL algorithm (td3 matches the paper).")
     parser.add_argument("--seed",            type=int,   default=0,
                         help="Global random seed. Run multiple seeds to measure variance.")
-    parser.add_argument("--num_envs",        type=int,   default=16)
+    parser.add_argument("--num_envs",        type=int,   default=32)
     parser.add_argument("--total_timesteps",  type=int,   default=3_000_000,
                         help="Total env steps (paper uses 3M for position control).")
     parser.add_argument("--curriculum_steps", type=int,   default=1_500_000,
@@ -303,6 +305,11 @@ def main() -> None:
                              "Training continues to --total_timesteps from the saved step count.")
     parser.add_argument("--obs_noise",        action="store_true",
                         help="Add sensor noise to observations (paper component).")
+    parser.add_argument("--multi_target",     action="store_true",
+                        help="When the drone reaches a waypoint, immediately assign a new "
+                             "random one instead of waiting for episode reset. Aligns training "
+                             "with eval_drone.py's sequential-waypoint protocol and forces the "
+                             "policy to learn repeated target-reaching within one episode.")
     parser.add_argument("--no_curriculum",    action="store_true",
                         help="Disable reward curriculum (ablation: degrades reliability).")
 
@@ -331,6 +338,7 @@ def main() -> None:
             env = DroneEnv(
                 render_mode=None, viewer=None,
                 random_targets=True,
+                multi_target=args.multi_target,
                 obs_noise=args.obs_noise,
                 curriculum=0.0,
             )
@@ -476,7 +484,7 @@ def main() -> None:
         f"envs={args.num_envs}  viewer={'off' if viewer is None else 'on'}\n"
         f"  {resume_str}\n"
         f"  curriculum_steps={args.curriculum_steps:,}  lr={lr_str}  "
-        f"early_stop={stop_str}  obs_noise={args.obs_noise}\n"
+        f"early_stop={stop_str}  obs_noise={args.obs_noise}  multi_target={args.multi_target}\n"
         f"  CF mass=27g  arm=32.5mm  hover≈{CF_HOVER_RPM:.0f} RPM  action=Level-5.1 RPM\n"
         f"  run → {run_name}  checkpoints → {args.checkpoint_dir}/{run_name}_*\n"
         f"  TensorBoard → tensorboard --logdir drone_logs\n"
