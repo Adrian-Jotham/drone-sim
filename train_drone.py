@@ -54,6 +54,7 @@ import warp as wp
 import newton
 import newton.examples
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+from tqdm import tqdm as _tqdm
 from stable_baselines3.common.noise import NormalActionNoise
 from stable_baselines3.common.vec_env import DummyVecEnv
 
@@ -274,6 +275,43 @@ class MetricsCallback(BaseCallback):
                 rec(f"reward_components/{k}", np.mean(buf))
 
 
+# ── Progress-bar callback that shows absolute step position ───────────────
+
+class AbsoluteProgressBar(BaseCallback):
+    """Progress bar whose counter and total are both in absolute steps.
+
+    SB3's built-in progress_bar=True uses tqdm.update(n_envs) each step,
+    so the display always starts from 0 regardless of the resume step.
+    This callback uses pbar.n = model.num_timesteps so the bar shows the
+    real position (e.g. 3,000,000 → 7,000,000) when resuming.
+    """
+
+    def __init__(self, total_timesteps: int) -> None:
+        super().__init__()
+        self._total = total_timesteps
+        self._pbar: _tqdm | None = None
+
+    def _on_training_start(self) -> None:
+        self._pbar = _tqdm(
+            total=self._total,
+            initial=self.model.num_timesteps,
+            unit="step",
+            dynamic_ncols=True,
+        )
+
+    def _on_step(self) -> bool:
+        if self._pbar is not None:
+            self._pbar.n = self.model.num_timesteps
+            self._pbar.refresh()
+        return True
+
+    def _on_training_end(self) -> None:
+        if self._pbar is not None:
+            self._pbar.n = self._total
+            self._pbar.refresh()
+            self._pbar.close()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -283,7 +321,7 @@ def main() -> None:
                         help="RL algorithm (td3 matches the paper).")
     parser.add_argument("--seed",            type=int,   default=0,
                         help="Global random seed. Run multiple seeds to measure variance.")
-    parser.add_argument("--num_envs",        type=int,   default=32)
+    parser.add_argument("--num_envs",        type=int,   default=128)
     parser.add_argument("--total_timesteps",  type=int,   default=3_000_000,
                         help="Total env steps (paper uses 3M for position control).")
     parser.add_argument("--curriculum_steps", type=int,   default=1_500_000,
@@ -364,10 +402,15 @@ def main() -> None:
 
     # ── Resolve checkpoint path ───────────────────────────────────────────
     resume_path = None
+    resume_steps = 0  # step count encoded in checkpoint filename (fallback)
     if args.resume is not None:
         resume_path = args.resume if args.resume.endswith(".zip") else args.resume + ".zip"
         if not os.path.exists(resume_path):
             raise FileNotFoundError(f"Checkpoint not found: '{resume_path}'")
+        import re
+        m = re.search(r'_(\d+)_steps', os.path.basename(resume_path))
+        if m:
+            resume_steps = int(m.group(1))
 
     # ── Build or load model ───────────────────────────────────────────────
     if algo == "ppo":
@@ -376,6 +419,8 @@ def main() -> None:
             model = PPO.load(resume_path, env=train_env)
             model.learning_rate    = learning_rate
             model.tensorboard_log  = tb_log
+            if model.num_timesteps < resume_steps:
+                model.num_timesteps = resume_steps
         else:
             model = PPO(
                 "MlpPolicy", train_env,
@@ -383,13 +428,13 @@ def main() -> None:
                 seed=args.seed,
                 learning_rate=learning_rate,
                 n_steps=2048,
-                batch_size=64,
+                batch_size=512,
                 n_epochs=10,
                 gamma=args.gamma,
                 gae_lambda=0.95,
-                clip_range=0.2,
-                ent_coef=0.005,
-                vf_coef=0.5,
+                clip_range=0.3,
+                ent_coef=0.02,
+                vf_coef=0.3,
                 max_grad_norm=0.5,
                 policy_kwargs=dict(net_arch=[256, 256]),
                 tensorboard_log=tb_log,
@@ -400,6 +445,8 @@ def main() -> None:
             model = SAC.load(resume_path, env=train_env)
             model.learning_rate    = learning_rate
             model.tensorboard_log  = tb_log
+            if model.num_timesteps < resume_steps:
+                model.num_timesteps = resume_steps
         else:
             model = SAC(
                 "MlpPolicy", train_env,
@@ -427,6 +474,8 @@ def main() -> None:
             model.learning_rate    = learning_rate
             model.tensorboard_log  = tb_log
             model.action_noise     = action_noise
+            if model.num_timesteps < resume_steps:
+                model.num_timesteps = resume_steps
         else:
             model = TD3(
                 "MlpPolicy", train_env,
@@ -493,11 +542,17 @@ def main() -> None:
     if steps_left == 0:
         print("  Nothing to train — checkpoint already at or beyond total_timesteps.")
     else:
+        if resume_path:
+            callbacks.append(AbsoluteProgressBar(args.total_timesteps))
+        # When reset_num_timesteps=False, SB3 internally adds model.num_timesteps to
+        # total_timesteps (so it treats the argument as a delta, not an absolute target).
+        # Pass steps_left (the delta) so the loop stops at the intended absolute step count.
+        learn_steps = steps_left if resume_path else args.total_timesteps
         model.learn(
-            total_timesteps=args.total_timesteps,
+            total_timesteps=learn_steps,
             callback=callbacks,
             tb_log_name=run_name,
-            progress_bar=True,
+            progress_bar=resume_path is None,
             reset_num_timesteps=resume_path is None,
         )
 
