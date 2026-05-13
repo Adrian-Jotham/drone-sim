@@ -283,7 +283,7 @@ def main() -> None:
                         help="RL algorithm (td3 matches the paper).")
     parser.add_argument("--seed",            type=int,   default=0,
                         help="Global random seed. Run multiple seeds to measure variance.")
-    parser.add_argument("--num_envs",        type=int,   default=32)
+    parser.add_argument("--num_envs",        type=int,   default=16)
     parser.add_argument("--total_timesteps",  type=int,   default=3_000_000,
                         help="Total env steps (paper uses 3M for position control).")
     parser.add_argument("--curriculum_steps", type=int,   default=1_500_000,

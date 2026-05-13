@@ -500,6 +500,64 @@ Curriculum ramps linearly from 0 → 1 over `--curriculum_steps` (default 1.5M, 
 
 ---
 
+## 8. Survival Bonus Redesign — Breaking the Hover Local Minimum
+
+### Why the flat survival bonus fails
+
+At `curriculum=1.0` with spawn at 0.7 m from target, per-step net reward doing nothing:
+
+```
+survival (flat)  = +0.50
+pos_c            = -1.00 × 0.7² = -0.49
+─────────────────────────────────────────
+net              = +0.01 / step  ← hovering costs almost nothing
+```
+
+The position penalty and survival bonus nearly cancel out. `approach` (+0.01/step for 1 cm/step motion) is too small to overcome PPO's gradient noise. The drone sits still, collects +0.01/step, and never moves.
+
+### Solution: Distance × Time decaying survival
+
+**Formula:**
+```python
+dist_factor = exp(-SURVIVAL_DIST_SCALE × dist)     # = exp(-1.0 × dist)
+time_factor = TIME_MIN + (1 - TIME_MIN) × (1 - step / MAX_STEPS)
+            = 0.2 + 0.8 × (1 - step/800)           # 1.0 → 0.2 over episode
+survival    = 0.50 × dist_factor × time_factor
+```
+
+### Net reward at key scenarios (curriculum=1.0)
+
+| Situation | survival | pos_c | net/step |
+|---|---|---|---|
+| Hovering at spawn (dist=0.7m, t=0) | +0.25 | -0.49 | **-0.24** — must move |
+| Approaching (dist=0.3m, t=400) | +0.19 | -0.09 | **+0.10** — rewarded |
+| At target (dist=0m, any time) | +0.50→+0.10 | 0 | **positive always** |
+| Early training spawn (dist=0.1m, curriculum=0) | +0.45 | -0.0005 | **+0.45** — safe ✓ |
+
+### What changed behaviourally
+
+| Behaviour | Old survival | New survival |
+|---|---|---|
+| Hover 0.7m from target | net ≈ 0 — stable local min | net = −0.24 — unstable, must move |
+| Approach over 400 steps | marginal gain | clearly positive gradient |
+| Reach and stay at target | +0.5+0.15/step | +0.5→+0.3/step + hover_bonus (still best strategy) |
+| Crash early (t=0→50) | loses future survival | loses future survival (same) |
+
+### Time pressure effect
+
+The `time_factor` decays from 1.0 → 0.2 over the episode:
+- **Early in episode:** full survival bonus if near target → drone learns to fly there fast
+- **Late in episode:** survival shrinks even at target → drone must arrive early to maximise cumulative reward
+- **Implicit urgency:** a drone that reaches the target at step 100 earns ~5× more total survival than one arriving at step 700
+
+Constants in [drone_gym_env.py](drone_gym_env.py):
+```python
+_SURVIVAL_DIST_SCALE = 1.0   # tune higher (e.g. 2.0) to decay faster with distance
+_SURVIVAL_TIME_MIN   = 0.2   # minimum floor at episode end — keeps stability incentive alive
+```
+
+---
+
 ## 6. SB3 PPO Constructor Parameters
 
 Reference: [train_drone.py:380-394](train_drone.py#L380-L394)

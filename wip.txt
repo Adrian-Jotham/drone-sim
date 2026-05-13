@@ -115,3 +115,4 @@ OMP_NUM_THREADS=4 python train_drone.py --algo ppo --seed 2 --num_envs 32 --tota
 # SAC reference
 OMP_NUM_THREADS=4 python train_drone.py --algo sac --seed 0 --num_envs 32 --total_timesteps 3000000 --headless
 TensorBoard will overlay all runs automatically — tensorboard --logdir drone_logs.
+
