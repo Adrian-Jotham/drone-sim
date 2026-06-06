@@ -14,3 +14,105 @@ Larger additions:
 Payload / slung load — add a second body connected by a Newton spring/constraint to the drone body. Tests swing damping.
 Obstacle avoidance — add static box shapes to the Newton scene; add distance-to-nearest-obstacle to the obs.
 Multi-agent formation — run N independent DroneEnv instances sharing a Newton scene, add inter-agent distance terms to the reward.
+
+Four distinct roles:
+
+1. Python/NumPy RNG (train_drone.py:324-325) — controls random numbers used for target position sampling, spawn randomization, and any other numpy operations during training.
+
+2. PyTorch RNG (train_drone.py:328-329) — controls neural network weight initialization. This is the biggest factor in convergence — different seeds give the network a different starting point in parameter space, which determines which local minimum it falls into.
+
+3. Per-environment reset seed (train_drone.py:345) — each of the 64 parallel envs gets seed + rank (e.g. seed=37 → env 0 gets 37, env 1 gets 38, ... env 63 gets 100). This makes the episode sequences for each env independent but still reproducible.
+
+4. Model seed (train_drone.py:383) — passed directly to SB3's PPO, which uses it for internal rollout buffer shuffling during mini-batch sampling.
+
+In short: same seed = fully reproducible run. Different seed = different network initialization + different environment episode sequences = potentially different local minimum. The seed doesn't change the reward function, curriculum, or any hyperparameters — only the randomness inside the optimization.
+
+
+
+
+Good instinct, but the two-phase switching has a simpler and more effective equivalent already in the code. Let me explain the full picture.
+
+Why your idea is theoretically sound
+
+Phase 1 (16 envs): fast updates → escape local minima
+Phase 2 (64 envs): diverse gradients → stable refinement
+This mirrors what's called coarse-to-fine training and it's used in some Isaac Lab setups. It works.
+
+But there's a cleaner way already in your code
+The same behavior is achieved automatically with learning rate decay (--lr_final), which you already have wired up:
+
+
+High LR early  → large gradient steps → escapes local minima (same effect as few envs + frequent updates)
+Low LR late    → small careful steps  → stable refinement    (same effect as many envs + diverse gradients)
+No manual checkpoint switching needed. Run this:
+
+
+OMP_NUM_THREADS=4 python train_drone.py \
+  --algo ppo \
+  --seed 37 \
+  --num_envs 32 \
+  --total_timesteps 10000000 \
+  --curriculum_steps 3000000 \
+  --learning_rate 1e-3 \
+  --lr_final 1e-5 \
+  --headless
+lr decays 1e-3 → 1e-5 linearly over 10M steps — aggressive early exploration, fine-tuning at the end.
+
+What the actual best practice is
+Approach	Verdict
+Switch num_envs at checkpoint	Works but manual, hard to know when to switch
+LR decay (--lr_final)	Same effect, automatic, already in your code
+High ent_coef early only	Best fix for entropy collapse — already changed to 0.02
+Fixed moderate num_envs (16–32)	Simpler than switching, good for PPO on control tasks
+For PPO on continuous control specifically, the field consensus (OpenAI, SB3 benchmarks) is 8–32 envs — not 64 or 128. The frequent update advantage matters more than diversity for on-policy methods. The paper used 8192 envs only because their simulator batched them into a single GPU kernel — effectively one simulation step, not 8192 sequential ones like your DummyVecEnv.
+
+Concrete recommendation
+Forget the two-phase switching. Use --num_envs 32 + --lr_final 1e-5 — it gives you the same curriculum of exploration→refinement automatically, plus the ent_coef=0.02 and clip_range=0.3 changes already in the code to prevent entropy collapse.
+
+
+
+Since this is a pure sim analysis of PPO, the most meaningful comparisons are:
+
+Recommended comparison set
+1. Hyperparameter ablation — isolates what actually fixes PPO on this task:
+
+Run	Purpose
+ppo_s0 — original (ent_coef=0.005, clip=0.2, vf=0.5)	Baseline (what failed)
+ppo_s0 — new (ent_coef=0.02, clip=0.3, vf=0.3)	Your current fix
+ppo_s0 — no curriculum (--no_curriculum)	Isolate curriculum impact
+ppo_s0 — no lr decay (no --lr_final)	Isolate LR schedule impact
+2. Seed reliability — 3 seeds of your best config:
+
+
+ppo_s0, ppo_s1, ppo_s2   (same hyperparams)
+This answers: "how often does PPO converge on this task?" — the core question for a sim analysis paper.
+
+3. Algorithm reference — one SAC run to anchor PPO's performance:
+
+
+python train_drone.py --algo sac --seed 0 --num_envs 32 --headless
+SAC is also off-policy + entropy-regularized (closer to paper's TD3) — gives you a ceiling to compare PPO against without running the full TD3 paper replication.
+
+What to measure and report
+Given your TensorBoard setup these are already logged:
+
+metrics/success_rate — primary metric
+metrics/terminal_dist — how close drone gets
+metrics/ep_length — proxy for flight stability
+train/entropy_loss — did it collapse?
+train/explained_variance — is value function learning?
+Practical run order
+Start these in sequence (each is a separate terminal):
+
+
+# Seed reliability (3 runs of best config)
+OMP_NUM_THREADS=4 python train_drone.py --algo ppo --seed 0 --num_envs 32 --total_timesteps 10000000 --curriculum_steps 3000000 --learning_rate 1e-3 --lr_final 1e-5 --headless
+
+OMP_NUM_THREADS=4 python train_drone.py --algo ppo --seed 1 --num_envs 32 --total_timesteps 10000000 --curriculum_steps 3000000 --learning_rate 1e-3 --lr_final 1e-5 --headless
+
+OMP_NUM_THREADS=4 python train_drone.py --algo ppo --seed 2 --num_envs 32 --total_timesteps 10000000 --curriculum_steps 3000000 --learning_rate 1e-3 --lr_final 1e-5 --headless
+
+# SAC reference
+OMP_NUM_THREADS=4 python train_drone.py --algo sac --seed 0 --num_envs 32 --total_timesteps 3000000 --headless
+TensorBoard will overlay all runs automatically — tensorboard --logdir drone_logs.
+

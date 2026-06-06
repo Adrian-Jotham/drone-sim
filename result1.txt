@@ -1,0 +1,624 @@
+(newton) ➜  dronesim git:(retrace) ✗ # ── Seed 1 progression (same seed, 3 timepoints) ─────────────────────────
+
+# 3M — curriculum just finished, early policy
+python eval_trajectory.py --model checkpoints/ppo_s1_3000000_steps \
+  --algo ppo --traj random --num_episodes 20 --clean_start
+
+# 30M — late training
+python eval_trajectory.py --model checkpoints/ppo_s1_30000000_steps \
+  --algo ppo --traj random --num_episodes 20 --clean_start
+
+# 40M final — converged
+python eval_trajectory.py --model ppo_drone_final_s1 \
+  --algo ppo --traj random --num_episodes 20 --clean_start
+
+Warp 1.13.0.dev20260302 initialized:
+   Git commit: 2675d53530597430af87c7425a1bbb40a2c5453a
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4070 Laptop GPU" (8 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/adrian/.cache/warp/1.13.0.dev20260302
+
+Loading PPO model from 'checkpoints/ppo_s1_3000000_steps' …
+Trajectory : random    r=0.5–1.5 m, z=0.3–1.2 m, uniform
+CF hover ≈ 14476 RPM  |  max 21702 RPM
+
+Module validate_and_correct_inertia_kernel_7693acc3 7693acc load on device 'cuda:0' took 0.58 ms  (cached)
+Module newton._src.viewer.gl.opengl cd0e606 load on device 'cuda:0' took 0.44 ms  (cached)
+Module newton._src.viewer.kernels 9252450 load on device 'cuda:0' took 1.64 ms  (cached)
+Module newton._src.geometry.raycast 28bf634 load on device 'cuda:0' took 2.15 ms  (cached)
+Wrapping the env with a `Monitor` wrapper
+Wrapping the env in a DummyVecEnv.
+/home/adrian/miniconda3/envs/newton/lib/python3.13/site-packages/stable_baselines3/common/on_policy_algorithm.py:150: UserWarning: You are trying to run PPO on the GPU, but it is primarily intended to run on the CPU when not using a CNN policy (you are using ActorCriticPolicy which should be a MlpPolicy). See https://github.com/DLR-RM/stable-baselines3/issues/1245 for more info. You can pass `device='cpu'` or `export CUDA_VISIBLE_DEVICES=` to force using the CPU.Note: The model will train, but the GPU utilization will be poor and the training might take longer than on CPU.
+  warnings.warn(
+Running 20 ep × up to 20 wps  (spawn=clean (curriculum=0.0), seed=42) …
+
+Module drone_gym_env 0f8d0ce load on device 'cuda:0' took 0.43 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_body 6919ce9 load on device 'cuda:0' took 1.75 ms  (cached)
+Module newton._src.solvers.solver 1843e22 load on device 'cuda:0' took 0.48 ms  (cached)
+Module newton._src.viewer.viewer_gl f06fbbc load on device 'cuda:0' took 0.48 ms  (cached)
+  ep  1/20 | reached= 1/20 | CRASH   | flight=  2.5s  1.4s/wp | rpm≈14425
+    ✓✗
+  ep  2/20 | reached= 1/20 | CRASH   | flight=  2.4s  1.3s/wp | rpm≈14230
+    ✓✗
+  ep  3/20 | reached= 0/20 | CRASH   | flight=  2.0s | rpm≈14391
+    ✗
+  ep  4/20 | reached= 2/20 | CRASH   | flight=  2.6s  0.9s/wp | rpm≈14125
+    ✓✓✗
+  ep  5/20 | reached= 5/20 | CRASH   | flight=  9.7s  1.8s/wp | rpm≈14406
+    ✓✓✓✓✓✗
+  ep  6/20 | reached= 4/20 | CRASH   | flight=  8.3s  1.8s/wp | rpm≈14517
+    ✓✓✓✓✗
+  ep  7/20 | reached= 5/20 | CRASH   | flight=  6.5s  1.1s/wp | rpm≈14255
+    ✓✓✓✓✓✗
+  ep  8/20 | reached= 0/20 | CRASH   | flight=  2.5s | rpm≈14319
+    ✗
+  ep  9/20 | reached= 1/20 | CRASH   | flight=  2.5s  1.6s/wp | rpm≈14508
+    ✓✗
+  ep 10/20 | reached= 6/20 | CRASH   | flight= 10.2s  1.5s/wp | rpm≈14532
+    ✓✓✓✓✓✓✗
+  ep 11/20 | reached= 1/20 | CRASH   | flight=  2.8s  1.5s/wp | rpm≈14665
+    ✓✗
+  ep 12/20 | reached= 4/20 | CRASH   | flight=  9.1s  1.7s/wp | rpm≈14495
+    ✓✓✓✓✗
+  ep 13/20 | reached= 2/20 | CRASH   | flight=  3.6s  1.5s/wp | rpm≈14309
+    ✓✓✗
+  ep 14/20 | reached= 2/20 | CRASH   | flight=  3.3s  1.3s/wp | rpm≈14080
+    ✓✓✗
+  ep 15/20 | reached= 2/20 | CRASH   | flight=  2.7s  0.9s/wp | rpm≈13958
+    ✓✓✗
+  ep 16/20 | reached= 1/20 | CRASH   | flight=  4.9s  3.4s/wp | rpm≈14332
+    ✓✗
+  ep 17/20 | reached= 0/20 | CRASH   | flight=  0.7s | rpm≈13173
+    ✗
+  ep 18/20 | reached= 3/20 | CRASH   | flight=  4.3s  1.3s/wp | rpm≈14306
+    ✓✓✓✗
+  ep 19/20 | reached= 8/20 | CRASH   | flight= 13.1s  1.6s/wp | rpm≈14354
+    ✓✓✓✓✓✓✓✓✗
+  ep 20/20 | reached= 6/20 | CRASH   | flight= 20.2s  1.8s/wp | rpm≈14691
+    ✓✓✓✓✓✓✗
+
+════════════════════════════════════════════════════════════════════
+  EVALUATION REPORT  [PPO]  —  random    r=0.5–1.5 m, z=0.3–1.2 m, uniform
+════════════════════════════════════════════════════════════════════
+  Episodes run          : 20  (waypoint cap = 20 / ep)
+
+  ── Episode outcomes ────────────────────────────────────────────
+  Crash rate            : 100.0%
+  Timeout rate          :   0.0%
+  Full-success rate     :   0.0%  (all 20 wps reached)
+  Mean wps / episode    : 2.7 ± 2.3  (cap 20)
+  Mean flight time      : 5.7 s / ep
+
+  ── Per-waypoint-attempt (leg-level) ────────────────────────────
+  Leg success rate      : 73.0%  (74 total attempts)
+  Mean time to reach wp : 1.53 ± 0.75 s  (successful legs only)
+  Mean leg distance     : 1.171 m  (wp-to-wp)
+  Mean arrival speed    : 0.419 m/s  (speed when dist < 0.15 m)
+  Mean closest (failed) : 1.240 m  (best dist before crash/timeout on failed legs)
+
+  ── Motor / Thrust ──────────────────────────────────────────────
+  Mean motor RPM        : 14303 RPM  (98.8% of hover)
+  Hover RPM             : 14476 RPM  (required for level flight)
+  Mean |RPM − hover|    : 227 RPM  (0 = perfect hover thrust)
+  Max RPM (hardware)    : 21702 RPM
+
+  ── Leg success rate by distance (random traj) ──────────────────
+    0.0–0.5m  [████████████████████]  100.0%  (n=5)
+    0.5–1.0m  [██████████████████░░]   93.3%  (n=15)
+    1.0–1.5m  [█████████████████░░░]   87.5%  (n=24)
+    1.5–3.0m  [█████████░░░░░░░░░░░]   46.7%  (n=30)
+════════════════════════════════════════════════════════════════════
+Warp 1.13.0.dev20260302 initialized:
+   Git commit: 2675d53530597430af87c7425a1bbb40a2c5453a
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4070 Laptop GPU" (8 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/adrian/.cache/warp/1.13.0.dev20260302
+
+Loading PPO model from 'checkpoints/ppo_s1_30000000_steps' …
+Trajectory : random    r=0.5–1.5 m, z=0.3–1.2 m, uniform
+CF hover ≈ 14476 RPM  |  max 21702 RPM
+
+Module validate_and_correct_inertia_kernel_7693acc3 7693acc load on device 'cuda:0' took 0.53 ms  (cached)
+Module newton._src.viewer.gl.opengl cd0e606 load on device 'cuda:0' took 0.42 ms  (cached)
+Module newton._src.viewer.kernels 9252450 load on device 'cuda:0' took 1.69 ms  (cached)
+Module newton._src.geometry.raycast 28bf634 load on device 'cuda:0' took 2.25 ms  (cached)
+Wrapping the env with a `Monitor` wrapper
+Wrapping the env in a DummyVecEnv.
+/home/adrian/miniconda3/envs/newton/lib/python3.13/site-packages/stable_baselines3/common/on_policy_algorithm.py:150: UserWarning: You are trying to run PPO on the GPU, but it is primarily intended to run on the CPU when not using a CNN policy (you are using ActorCriticPolicy which should be a MlpPolicy). See https://github.com/DLR-RM/stable-baselines3/issues/1245 for more info. You can pass `device='cpu'` or `export CUDA_VISIBLE_DEVICES=` to force using the CPU.Note: The model will train, but the GPU utilization will be poor and the training might take longer than on CPU.
+  warnings.warn(
+Running 20 ep × up to 20 wps  (spawn=clean (curriculum=0.0), seed=42) …
+
+Module drone_gym_env 0f8d0ce load on device 'cuda:0' took 0.44 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_body 6919ce9 load on device 'cuda:0' took 1.79 ms  (cached)
+Module newton._src.solvers.solver 1843e22 load on device 'cuda:0' took 0.49 ms  (cached)
+Module newton._src.viewer.viewer_gl f06fbbc load on device 'cuda:0' took 0.48 ms  (cached)
+  ep  1/20 | reached= 9/20 | CRASH   | flight= 18.7s  2.0s/wp | rpm≈14052
+    ✓✓✓✓✓✓✓✓✓✗
+  ep  2/20 | reached=12/20 | CRASH   | flight= 16.9s  1.4s/wp | rpm≈13995
+    ✓✓✓✓✓✓✓✓✓✓✓✓✗
+  ep  3/20 | reached= 2/20 | CRASH   | flight=  4.2s  1.6s/wp | rpm≈13859
+    ✓✓✗
+  ep  4/20 | reached= 9/20 | CRASH   | flight= 15.0s  1.6s/wp | rpm≈14074
+    ✓✓✓✓✓✓✓✓✓✗
+  ep  5/20 | reached= 2/20 | CRASH   | flight=  4.2s  1.5s/wp | rpm≈13940
+    ✓✓✗
+  ep  6/20 | reached= 4/20 | CRASH   | flight=  9.1s  2.1s/wp | rpm≈13851
+    ✓✓✓✓✗
+  ep  7/20 | reached= 6/20 | CRASH   | flight=  9.1s  1.4s/wp | rpm≈13858
+    ✓✓✓✓✓✓✗
+  ep  8/20 | reached= 5/20 | CRASH   | flight=  8.2s  1.5s/wp | rpm≈14043
+    ✓✓✓✓✓✗
+  ep  9/20 | reached= 1/20 | CRASH   | flight=  2.6s  1.6s/wp | rpm≈14221
+    ✓✗
+  ep 10/20 | reached= 2/20 | CRASH   | flight=  3.2s  1.3s/wp | rpm≈13819
+    ✓✓✗
+  ep 11/20 | reached= 1/20 | CRASH   | flight=  2.5s  1.5s/wp | rpm≈14044
+    ✓✗
+  ep 12/20 | reached= 5/20 | CRASH   | flight=  8.3s  1.5s/wp | rpm≈14138
+    ✓✓✓✓✓✗
+  ep 13/20 | reached= 5/20 | CRASH   | flight=  7.0s  1.2s/wp | rpm≈14040
+    ✓✓✓✓✓✗
+  ep 14/20 | reached= 5/20 | CRASH   | flight= 11.7s  2.0s/wp | rpm≈14241
+    ✓✓✓✓✓✗
+  ep 15/20 | reached= 6/20 | CRASH   | flight=  9.7s  1.5s/wp | rpm≈14096
+    ✓✓✓✓✓✓✗
+  ep 16/20 | reached= 4/20 | CRASH   | flight=  7.5s  1.6s/wp | rpm≈14222
+    ✓✓✓✓✗
+  ep 17/20 | reached= 2/20 | CRASH   | flight=  4.1s  1.5s/wp | rpm≈13975
+    ✓✓✗
+  ep 18/20 | reached= 5/20 | CRASH   | flight=  9.6s  1.5s/wp | rpm≈14118
+    ✓✓✓✓✓✗
+  ep 19/20 | reached=11/20 | CRASH   | flight= 17.7s  1.5s/wp | rpm≈14164
+    ✓✓✓✓✓✓✓✓✓✓✓✗
+  ep 20/20 | reached= 1/20 | CRASH   | flight=  2.5s  1.4s/wp | rpm≈14033
+    ✓✗
+
+════════════════════════════════════════════════════════════════════
+  EVALUATION REPORT  [PPO]  —  random    r=0.5–1.5 m, z=0.3–1.2 m, uniform
+════════════════════════════════════════════════════════════════════
+  Episodes run          : 20  (waypoint cap = 20 / ep)
+
+  ── Episode outcomes ────────────────────────────────────────────
+  Crash rate            : 100.0%
+  Timeout rate          :   0.0%
+  Full-success rate     :   0.0%  (all 20 wps reached)
+  Mean wps / episode    : 4.8 ± 3.2  (cap 20)
+  Mean flight time      : 8.6 s / ep
+
+  ── Per-waypoint-attempt (leg-level) ────────────────────────────
+  Leg success rate      : 82.9%  (117 total attempts)
+  Mean time to reach wp : 1.57 ± 0.53 s  (successful legs only)
+  Mean leg distance     : 1.264 m  (wp-to-wp)
+  Mean arrival speed    : 0.326 m/s  (speed when dist < 0.15 m)
+  Mean closest (failed) : 1.239 m  (best dist before crash/timeout on failed legs)
+
+  ── Motor / Thrust ──────────────────────────────────────────────
+  Mean motor RPM        : 14039 RPM  (97.0% of hover)
+  Hover RPM             : 14476 RPM  (required for level flight)
+  Mean |RPM − hover|    : 437 RPM  (0 = perfect hover thrust)
+  Max RPM (hardware)    : 21702 RPM
+
+  ── Leg success rate by distance (random traj) ──────────────────
+    0.0–0.5m  [████████████████████]  100.0%  (n=6)
+    0.5–1.0m  [███████████████████░]   96.3%  (n=27)
+    1.0–1.5m  [██████████████████░░]   91.9%  (n=37)
+    1.5–3.0m  [█████████████░░░░░░░]   66.0%  (n=47)
+════════════════════════════════════════════════════════════════════
+Warp 1.13.0.dev20260302 initialized:
+   Git commit: 2675d53530597430af87c7425a1bbb40a2c5453a
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4070 Laptop GPU" (8 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/adrian/.cache/warp/1.13.0.dev20260302
+
+Loading PPO model from 'ppo_drone_final_s1' …
+Trajectory : random    r=0.5–1.5 m, z=0.3–1.2 m, uniform
+CF hover ≈ 14476 RPM  |  max 21702 RPM
+
+Module validate_and_correct_inertia_kernel_7693acc3 7693acc load on device 'cuda:0' took 0.57 ms  (cached)
+Module newton._src.viewer.gl.opengl cd0e606 load on device 'cuda:0' took 0.43 ms  (cached)
+Module newton._src.viewer.kernels 9252450 load on device 'cuda:0' took 1.67 ms  (cached)
+Module newton._src.geometry.raycast 28bf634 load on device 'cuda:0' took 2.34 ms  (cached)
+Wrapping the env with a `Monitor` wrapper
+Wrapping the env in a DummyVecEnv.
+/home/adrian/miniconda3/envs/newton/lib/python3.13/site-packages/stable_baselines3/common/on_policy_algorithm.py:150: UserWarning: You are trying to run PPO on the GPU, but it is primarily intended to run on the CPU when not using a CNN policy (you are using ActorCriticPolicy which should be a MlpPolicy). See https://github.com/DLR-RM/stable-baselines3/issues/1245 for more info. You can pass `device='cpu'` or `export CUDA_VISIBLE_DEVICES=` to force using the CPU.Note: The model will train, but the GPU utilization will be poor and the training might take longer than on CPU.
+  warnings.warn(
+Running 20 ep × up to 20 wps  (spawn=clean (curriculum=0.0), seed=42) …
+
+Module drone_gym_env 0f8d0ce load on device 'cuda:0' took 0.44 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_body 6919ce9 load on device 'cuda:0' took 1.82 ms  (cached)
+Module newton._src.solvers.solver 1843e22 load on device 'cuda:0' took 0.48 ms  (cached)
+Module newton._src.viewer.viewer_gl f06fbbc load on device 'cuda:0' took 0.48 ms  (cached)
+  ep  1/20 | reached= 2/20 | CRASH   | flight=  4.2s  1.6s/wp | rpm≈14092
+    ✓✓✗
+  ep  2/20 | reached= 8/20 | CRASH   | flight= 10.6s  1.3s/wp | rpm≈13996
+    ✓✓✓✓✓✓✓✓✗
+  ep  3/20 | reached= 2/20 | CRASH   | flight=  5.2s  1.6s/wp | rpm≈14087
+    ✓✓✗
+  ep  4/20 | reached= 9/20 | CRASH   | flight= 14.3s  1.5s/wp | rpm≈14099
+    ✓✓✓✓✓✓✓✓✓✗
+  ep  5/20 | reached=10/20 | CRASH   | flight= 15.6s  1.4s/wp | rpm≈13685
+    ✓✓✓✓✓✓✓✓✓✓✗
+  ep  6/20 | reached= 4/20 | CRASH   | flight=  8.1s  1.6s/wp | rpm≈13956
+    ✓✓✓✓✗
+  ep  7/20 | reached= 6/20 | CRASH   | flight=  7.7s  1.2s/wp | rpm≈13891
+    ✓✓✓✓✓✓✗
+  ep  8/20 | reached= 3/20 | CRASH   | flight=  8.0s  2.2s/wp | rpm≈13957
+    ✓✓✓✗
+  ep  9/20 | reached= 2/20 | CRASH   | flight=  4.6s  1.8s/wp | rpm≈14299
+    ✓✓✗
+  ep 10/20 | reached= 2/20 | CRASH   | flight=  3.4s  1.2s/wp | rpm≈13938
+    ✓✓✗
+  ep 11/20 | reached= 1/20 | CRASH   | flight=  3.1s  1.6s/wp | rpm≈13991
+    ✓✗
+  ep 12/20 | reached= 5/20 | CRASH   | flight=  9.2s  1.7s/wp | rpm≈14174
+    ✓✓✓✓✓✗
+  ep 13/20 | reached= 2/20 | CRASH   | flight=  4.0s  1.6s/wp | rpm≈14012
+    ✓✓✗
+  ep 14/20 | reached= 1/20 | CRASH   | flight=  2.6s  1.4s/wp | rpm≈14315
+    ✓✗
+  ep 15/20 | reached= 5/20 | CRASH   | flight=  9.1s  1.3s/wp | rpm≈14168
+    ✓✓✓✓✓✗
+  ep 16/20 | reached= 4/20 | CRASH   | flight=  8.8s  2.0s/wp | rpm≈14255
+    ✓✓✓✓✗
+  ep 17/20 | reached= 2/20 | CRASH   | flight=  3.9s  1.6s/wp | rpm≈14183
+    ✓✓✗
+  ep 18/20 | reached= 6/20 | CRASH   | flight= 13.6s  2.2s/wp | rpm≈13846
+    ✓✓✓✓✓✓✗
+  ep 19/20 | reached=15/20 | CRASH   | flight= 24.0s  1.5s/wp | rpm≈14065
+    ✓✓✓✓✓✓✓✓✓✓✓✓✓✓✓✗
+  ep 20/20 | reached= 1/20 | CRASH   | flight=  2.7s  1.4s/wp | rpm≈14204
+    ✓✗
+
+════════════════════════════════════════════════════════════════════
+  EVALUATION REPORT  [PPO]  —  random    r=0.5–1.5 m, z=0.3–1.2 m, uniform
+════════════════════════════════════════════════════════════════════
+  Episodes run          : 20  (waypoint cap = 20 / ep)
+
+  ── Episode outcomes ────────────────────────────────────────────
+  Crash rate            : 100.0%
+  Timeout rate          :   0.0%
+  Full-success rate     :   0.0%  (all 20 wps reached)
+  Mean wps / episode    : 4.5 ± 3.6  (cap 20)
+  Mean flight time      : 8.1 s / ep
+
+  ── Per-waypoint-attempt (leg-level) ────────────────────────────
+  Leg success rate      : 81.8%  (110 total attempts)
+  Mean time to reach wp : 1.56 ± 0.67 s  (successful legs only)
+  Mean leg distance     : 1.232 m  (wp-to-wp)
+  Mean arrival speed    : 0.294 m/s  (speed when dist < 0.15 m)
+  Mean closest (failed) : 0.967 m  (best dist before crash/timeout on failed legs)
+
+  ── Motor / Thrust ──────────────────────────────────────────────
+  Mean motor RPM        : 14061 RPM  (97.1% of hover)
+  Hover RPM             : 14476 RPM  (required for level flight)
+  Mean |RPM − hover|    : 415 RPM  (0 = perfect hover thrust)
+  Max RPM (hardware)    : 21702 RPM
+
+  ── Leg success rate by distance (random traj) ──────────────────
+    0.0–0.5m  [████████████████████]  100.0%  (n=7)
+    0.5–1.0m  [██████████████████░░]   92.9%  (n=28)
+    1.0–1.5m  [█████████████████░░░]   87.1%  (n=31)
+    1.5–3.0m  [█████████████░░░░░░░]   68.2%  (n=44)
+════════════════════════════════════════════════════════════════════
+
+
+
+(newton) ➜  dronesim git:(retrace) # ── Seed 1 progression (same seed, 3 timepoints) ─────────────────────────
+
+# 3M — curriculum just finished, early policy
+python eval_trajectory.py --model checkpoints/ppo_s1_3000000_steps \
+  --algo ppo --traj random --num_episodes 20              
+
+# 30M — late training
+python eval_trajectory.py --model checkpoints/ppo_s1_30000000_steps \
+  --algo ppo --traj random --num_episodes 20              
+
+# 40M final — converged
+python eval_trajectory.py --model ppo_drone_final_s1 \
+  --algo ppo --traj random --num_episodes 20              
+
+Warp 1.13.0.dev20260302 initialized:
+   Git commit: 2675d53530597430af87c7425a1bbb40a2c5453a
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4070 Laptop GPU" (8 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/adrian/.cache/warp/1.13.0.dev20260302
+
+Loading PPO model from 'checkpoints/ppo_s1_3000000_steps' …
+Trajectory : random    r=0.5–1.5 m, z=0.3–1.2 m, uniform
+CF hover ≈ 14476 RPM  |  max 21702 RPM
+
+Module validate_and_correct_inertia_kernel_7693acc3 7693acc load on device 'cuda:0' took 0.48 ms  (cached)
+Module newton._src.viewer.gl.opengl cd0e606 load on device 'cuda:0' took 0.40 ms  (cached)
+Module newton._src.viewer.kernels 9252450 load on device 'cuda:0' took 1.56 ms  (cached)
+Module newton._src.geometry.raycast 28bf634 load on device 'cuda:0' took 2.12 ms  (cached)
+Wrapping the env with a `Monitor` wrapper
+Wrapping the env in a DummyVecEnv.
+/home/adrian/miniconda3/envs/newton/lib/python3.13/site-packages/stable_baselines3/common/on_policy_algorithm.py:150: UserWarning: You are trying to run PPO on the GPU, but it is primarily intended to run on the CPU when not using a CNN policy (you are using ActorCriticPolicy which should be a MlpPolicy). See https://github.com/DLR-RM/stable-baselines3/issues/1245 for more info. You can pass `device='cpu'` or `export CUDA_VISIBLE_DEVICES=` to force using the CPU.Note: The model will train, but the GPU utilization will be poor and the training might take longer than on CPU.
+  warnings.warn(
+Running 20 ep × up to 20 wps  (spawn=randomised (curriculum=1.0), seed=42) …
+
+Module drone_gym_env 0f8d0ce load on device 'cuda:0' took 0.45 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_body 6919ce9 load on device 'cuda:0' took 1.82 ms  (cached)
+Module newton._src.solvers.solver 1843e22 load on device 'cuda:0' took 0.51 ms  (cached)
+Module newton._src.viewer.viewer_gl f06fbbc load on device 'cuda:0' took 0.50 ms  (cached)
+  ep  1/20 | reached= 2/20 | CRASH   | flight=  3.9s  1.5s/wp | rpm≈14296
+    ✓✓✗
+  ep  2/20 | reached= 0/20 | CRASH   | flight=  0.3s | rpm≈13736
+    ✗
+  ep  3/20 | reached= 0/20 | CRASH   | flight=  1.5s | rpm≈14552
+    ✗
+  ep  4/20 | reached= 0/20 | CRASH   | flight=  4.8s | rpm≈14329
+    ✗
+  ep  5/20 | reached= 1/20 | CRASH   | flight=  2.1s  1.1s/wp | rpm≈14096
+    ✓✗
+  ep  6/20 | reached= 0/20 | CRASH   | flight=  0.9s | rpm≈13216
+    ✗
+  ep  7/20 | reached= 0/20 | CRASH   | flight=  1.1s | rpm≈13433
+    ✗
+  ep  8/20 | reached= 0/20 | CRASH   | flight=  2.3s | rpm≈14166
+    ✗
+  ep  9/20 | reached= 2/20 | CRASH   | flight=  5.4s  2.4s/wp | rpm≈14191
+    ✓✓✗
+  ep 10/20 | reached= 0/20 | CRASH   | flight=  1.5s | rpm≈13459
+    ✗
+  ep 11/20 | reached= 0/20 | CRASH   | flight=  0.9s | rpm≈14283
+    ✗
+  ep 12/20 | reached= 1/20 | CRASH   | flight=  2.5s  1.3s/wp | rpm≈14047
+    ✓✗
+  ep 13/20 | reached= 1/20 | CRASH   | flight=  2.6s  1.4s/wp | rpm≈14241
+    ✓✗
+  ep 14/20 | reached= 0/20 | CRASH   | flight=  2.8s | rpm≈14637
+    ✗
+  ep 15/20 | reached= 0/20 | CRASH   | flight=  1.8s | rpm≈13768
+    ✗
+  ep 16/20 | reached= 0/20 | CRASH   | flight=  2.1s | rpm≈14136
+    ✗
+  ep 17/20 | reached= 0/20 | CRASH   | flight=  0.7s | rpm≈10844
+    ✗
+  ep 18/20 | reached= 0/20 | CRASH   | flight=  2.5s | rpm≈13496
+    ✗
+  ep 19/20 | reached= 0/20 | CRASH   | flight=  1.3s | rpm≈13646
+    ✗
+  ep 20/20 | reached= 0/20 | CRASH   | flight=  1.0s | rpm≈13348
+    ✗
+
+════════════════════════════════════════════════════════════════════
+  EVALUATION REPORT  [PPO]  —  random    r=0.5–1.5 m, z=0.3–1.2 m, uniform
+════════════════════════════════════════════════════════════════════
+  Episodes run          : 20  (waypoint cap = 20 / ep)
+
+  ── Episode outcomes ────────────────────────────────────────────
+  Crash rate            : 100.0%
+  Timeout rate          :   0.0%
+  Full-success rate     :   0.0%  (all 20 wps reached)
+  Mean wps / episode    : 0.3 ± 0.7  (cap 20)
+  Mean flight time      : 2.1 s / ep
+
+  ── Per-waypoint-attempt (leg-level) ────────────────────────────
+  Leg success rate      : 25.9%  (27 total attempts)
+  Mean time to reach wp : 1.67 ± 0.62 s  (successful legs only)
+  Mean leg distance     : 1.295 m  (wp-to-wp)
+  Mean arrival speed    : 0.642 m/s  (speed when dist < 0.15 m)
+  Mean closest (failed) : 0.901 m  (best dist before crash/timeout on failed legs)
+
+  ── Motor / Thrust ──────────────────────────────────────────────
+  Mean motor RPM        : 13796 RPM  (95.3% of hover)
+  Hover RPM             : 14476 RPM  (required for level flight)
+  Mean |RPM − hover|    : 704 RPM  (0 = perfect hover thrust)
+  Max RPM (hardware)    : 21702 RPM
+
+  ── Leg success rate by distance (random traj) ──────────────────
+    0.5–1.0m  [██████░░░░░░░░░░░░░░]   33.3%  (n=6)
+    1.0–1.5m  [███░░░░░░░░░░░░░░░░░]   16.7%  (n=12)
+    1.5–3.0m  [██████░░░░░░░░░░░░░░]   33.3%  (n=9)
+════════════════════════════════════════════════════════════════════
+Warp 1.13.0.dev20260302 initialized:
+   Git commit: 2675d53530597430af87c7425a1bbb40a2c5453a
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4070 Laptop GPU" (8 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/adrian/.cache/warp/1.13.0.dev20260302
+
+Loading PPO model from 'checkpoints/ppo_s1_30000000_steps' …
+Trajectory : random    r=0.5–1.5 m, z=0.3–1.2 m, uniform
+CF hover ≈ 14476 RPM  |  max 21702 RPM
+
+Module validate_and_correct_inertia_kernel_7693acc3 7693acc load on device 'cuda:0' took 0.47 ms  (cached)
+Module newton._src.viewer.gl.opengl cd0e606 load on device 'cuda:0' took 0.43 ms  (cached)
+Module newton._src.viewer.kernels 9252450 load on device 'cuda:0' took 1.54 ms  (cached)
+Module newton._src.geometry.raycast 28bf634 load on device 'cuda:0' took 2.11 ms  (cached)
+Wrapping the env with a `Monitor` wrapper
+Wrapping the env in a DummyVecEnv.
+/home/adrian/miniconda3/envs/newton/lib/python3.13/site-packages/stable_baselines3/common/on_policy_algorithm.py:150: UserWarning: You are trying to run PPO on the GPU, but it is primarily intended to run on the CPU when not using a CNN policy (you are using ActorCriticPolicy which should be a MlpPolicy). See https://github.com/DLR-RM/stable-baselines3/issues/1245 for more info. You can pass `device='cpu'` or `export CUDA_VISIBLE_DEVICES=` to force using the CPU.Note: The model will train, but the GPU utilization will be poor and the training might take longer than on CPU.
+  warnings.warn(
+Running 20 ep × up to 20 wps  (spawn=randomised (curriculum=1.0), seed=42) …
+
+Module drone_gym_env 0f8d0ce load on device 'cuda:0' took 0.44 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_body 6919ce9 load on device 'cuda:0' took 1.81 ms  (cached)
+Module newton._src.solvers.solver 1843e22 load on device 'cuda:0' took 0.47 ms  (cached)
+Module newton._src.viewer.viewer_gl f06fbbc load on device 'cuda:0' took 0.47 ms  (cached)
+  ep  1/20 | reached= 2/20 | CRASH   | flight=  5.5s  2.3s/wp | rpm≈14077
+    ✓✓✗
+  ep  2/20 | reached= 1/20 | CRASH   | flight=  3.0s  1.6s/wp | rpm≈13585
+    ✓✗
+  ep  3/20 | reached= 0/20 | CRASH   | flight=  0.3s | rpm≈10040
+    ✗
+  ep  4/20 | reached= 2/20 | CRASH   | flight=  4.1s  1.6s/wp | rpm≈13735
+    ✓✓✗
+  ep  5/20 | reached= 1/20 | CRASH   | flight=  0.7s  0.2s/wp | rpm≈13172
+    ✓✗
+  ep  6/20 | reached= 2/20 | CRASH   | flight=  5.8s  2.5s/wp | rpm≈13756
+    ✓✓✗
+  ep  7/20 | reached= 0/20 | CRASH   | flight=  0.8s | rpm≈11310
+    ✗
+  ep  8/20 | reached= 1/20 | CRASH   | flight=  4.4s  3.7s/wp | rpm≈14001
+    ✓✗
+  ep  9/20 | reached= 0/20 | CRASH   | flight=  0.2s | rpm≈13192
+    ✗
+  ep 10/20 | reached= 0/20 | CRASH   | flight=  0.4s | rpm≈12213
+    ✗
+  ep 11/20 | reached= 2/20 | CRASH   | flight=  5.9s  2.5s/wp | rpm≈13855
+    ✓✓✗
+  ep 12/20 | reached= 0/20 | CRASH   | flight=  0.5s | rpm≈14133
+    ✗
+  ep 13/20 | reached= 2/20 | CRASH   | flight=  4.3s  1.9s/wp | rpm≈13786
+    ✓✓✗
+  ep 14/20 | reached= 0/20 | CRASH   | flight=  0.9s | rpm≈12225
+    ✗
+  ep 15/20 | reached= 1/20 | CRASH   | flight=  2.2s  1.4s/wp | rpm≈13633
+    ✓✗
+  ep 16/20 | reached= 1/20 | CRASH   | flight=  2.2s  1.9s/wp | rpm≈13723
+    ✓✗
+  ep 17/20 | reached= 0/20 | CRASH   | flight=  0.5s | rpm≈13795
+    ✗
+  ep 18/20 | reached= 0/20 | CRASH   | flight=  0.4s | rpm≈13605
+    ✗
+  ep 19/20 | reached= 0/20 | CRASH   | flight=  1.1s | rpm≈13364
+    ✗
+  ep 20/20 | reached= 0/20 | CRASH   | flight=  0.2s | rpm≈13737
+    ✗
+
+════════════════════════════════════════════════════════════════════
+  EVALUATION REPORT  [PPO]  —  random    r=0.5–1.5 m, z=0.3–1.2 m, uniform
+════════════════════════════════════════════════════════════════════
+  Episodes run          : 20  (waypoint cap = 20 / ep)
+
+  ── Episode outcomes ────────────────────────────────────────────
+  Crash rate            : 100.0%
+  Timeout rate          :   0.0%
+  Full-success rate     :   0.0%  (all 20 wps reached)
+  Mean wps / episode    : 0.8 ± 0.8  (cap 20)
+  Mean flight time      : 2.2 s / ep
+
+  ── Per-waypoint-attempt (leg-level) ────────────────────────────
+  Leg success rate      : 42.9%  (35 total attempts)
+  Mean time to reach wp : 2.05 ± 0.90 s  (successful legs only)
+  Mean leg distance     : 1.327 m  (wp-to-wp)
+  Mean arrival speed    : 0.634 m/s  (speed when dist < 0.15 m)
+  Mean closest (failed) : 1.519 m  (best dist before crash/timeout on failed legs)
+
+  ── Motor / Thrust ──────────────────────────────────────────────
+  Mean motor RPM        : 13247 RPM  (91.5% of hover)
+  Hover RPM             : 14476 RPM  (required for level flight)
+  Mean |RPM − hover|    : 1229 RPM  (0 = perfect hover thrust)
+  Max RPM (hardware)    : 21702 RPM
+
+  ── Leg success rate by distance (random traj) ──────────────────
+    0.0–0.5m  [████████████████████]  100.0%  (n=1)
+    0.5–1.0m  [██████████░░░░░░░░░░]   50.0%  (n=6)
+    1.0–1.5m  [███████░░░░░░░░░░░░░]   35.7%  (n=14)
+    1.5–3.0m  [████████░░░░░░░░░░░░]   42.9%  (n=14)
+════════════════════════════════════════════════════════════════════
+Warp 1.13.0.dev20260302 initialized:
+   Git commit: 2675d53530597430af87c7425a1bbb40a2c5453a
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4070 Laptop GPU" (8 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/adrian/.cache/warp/1.13.0.dev20260302
+
+Loading PPO model from 'ppo_drone_final_s1' …
+Trajectory : random    r=0.5–1.5 m, z=0.3–1.2 m, uniform
+CF hover ≈ 14476 RPM  |  max 21702 RPM
+
+Module validate_and_correct_inertia_kernel_7693acc3 7693acc load on device 'cuda:0' took 0.48 ms  (cached)
+Module newton._src.viewer.gl.opengl cd0e606 load on device 'cuda:0' took 0.43 ms  (cached)
+Module newton._src.viewer.kernels 9252450 load on device 'cuda:0' took 1.51 ms  (cached)
+Module newton._src.geometry.raycast 28bf634 load on device 'cuda:0' took 2.04 ms  (cached)
+Wrapping the env with a `Monitor` wrapper
+Wrapping the env in a DummyVecEnv.
+/home/adrian/miniconda3/envs/newton/lib/python3.13/site-packages/stable_baselines3/common/on_policy_algorithm.py:150: UserWarning: You are trying to run PPO on the GPU, but it is primarily intended to run on the CPU when not using a CNN policy (you are using ActorCriticPolicy which should be a MlpPolicy). See https://github.com/DLR-RM/stable-baselines3/issues/1245 for more info. You can pass `device='cpu'` or `export CUDA_VISIBLE_DEVICES=` to force using the CPU.Note: The model will train, but the GPU utilization will be poor and the training might take longer than on CPU.
+  warnings.warn(
+Running 20 ep × up to 20 wps  (spawn=randomised (curriculum=1.0), seed=42) …
+
+Module drone_gym_env 0f8d0ce load on device 'cuda:0' took 0.43 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_body 6919ce9 load on device 'cuda:0' took 1.76 ms  (cached)
+Module newton._src.solvers.solver 1843e22 load on device 'cuda:0' took 0.47 ms  (cached)
+Module newton._src.viewer.viewer_gl f06fbbc load on device 'cuda:0' took 0.47 ms  (cached)
+  ep  1/20 | reached= 2/20 | CRASH   | flight=  3.5s  1.6s/wp | rpm≈13834
+    ✓✓✗
+  ep  2/20 | reached= 2/20 | CRASH   | flight=  4.3s  1.7s/wp | rpm≈13508
+    ✓✓✗
+  ep  3/20 | reached= 1/20 | CRASH   | flight=  2.2s  1.9s/wp | rpm≈13794
+    ✓✗
+  ep  4/20 | reached= 2/20 | CRASH   | flight=  4.0s  1.8s/wp | rpm≈13421
+    ✓✓✗
+  ep  5/20 | reached= 3/20 | CRASH   | flight=  8.3s  2.6s/wp | rpm≈13616
+    ✓✓✓✗
+  ep  6/20 | reached= 0/20 | CRASH   | flight=  0.6s | rpm≈13350
+    ✗
+  ep  7/20 | reached= 0/20 | CRASH   | flight=  0.5s | rpm≈9804
+    ✗
+  ep  8/20 | reached= 0/20 | CRASH   | flight=  0.8s | rpm≈13229
+    ✗
+  ep  9/20 | reached= 0/20 | CRASH   | flight=  0.5s | rpm≈12921
+    ✗
+  ep 10/20 | reached= 0/20 | CRASH   | flight=  0.5s | rpm≈9565
+    ✗
+  ep 11/20 | reached= 1/20 | CRASH   | flight=  2.1s  1.4s/wp | rpm≈14250
+    ✓✗
+  ep 12/20 | reached= 0/20 | CRASH   | flight=  2.0s | rpm≈13481
+    ✗
+  ep 13/20 | reached= 0/20 | CRASH   | flight=  1.0s | rpm≈11792
+    ✗
+  ep 14/20 | reached= 0/20 | CRASH   | flight=  0.8s | rpm≈14398
+    ✗
+  ep 15/20 | reached= 0/20 | CRASH   | flight=  0.8s | rpm≈12234
+    ✗
+  ep 16/20 | reached= 4/20 | CRASH   | flight=  6.1s  1.4s/wp | rpm≈14187
+    ✓✓✓✓✗
+  ep 17/20 | reached= 0/20 | CRASH   | flight=  0.4s | rpm≈12649
+    ✗
+  ep 18/20 | reached= 7/20 | CRASH   | flight= 13.0s  1.5s/wp | rpm≈14240
+    ✓✓✓✓✓✓✓✗
+  ep 19/20 | reached= 1/20 | CRASH   | flight=  1.9s  1.0s/wp | rpm≈13713
+    ✓✗
+  ep 20/20 | reached= 0/20 | CRASH   | flight=  0.2s | rpm≈12560
+    ✗
+
+════════════════════════════════════════════════════════════════════
+  EVALUATION REPORT  [PPO]  —  random    r=0.5–1.5 m, z=0.3–1.2 m, uniform
+════════════════════════════════════════════════════════════════════
+  Episodes run          : 20  (waypoint cap = 20 / ep)
+
+  ── Episode outcomes ────────────────────────────────────────────
+  Crash rate            : 100.0%
+  Timeout rate          :   0.0%
+  Full-success rate     :   0.0%  (all 20 wps reached)
+  Mean wps / episode    : 1.1 ± 1.8  (cap 20)
+  Mean flight time      : 2.7 s / ep
+
+  ── Per-waypoint-attempt (leg-level) ────────────────────────────
+  Leg success rate      : 53.5%  (43 total attempts)
+  Mean time to reach wp : 1.68 ± 0.72 s  (successful legs only)
+  Mean leg distance     : 1.350 m  (wp-to-wp)
+  Mean arrival speed    : 0.527 m/s  (speed when dist < 0.15 m)
+  Mean closest (failed) : 1.297 m  (best dist before crash/timeout on failed legs)
+
+  ── Motor / Thrust ──────────────────────────────────────────────
+  Mean motor RPM        : 13027 RPM  (90.0% of hover)
+  Hover RPM             : 14476 RPM  (required for level flight)
+  Mean |RPM − hover|    : 1449 RPM  (0 = perfect hover thrust)
+  Max RPM (hardware)    : 21702 RPM
+
+  ── Leg success rate by distance (random traj) ──────────────────
+    0.0–0.5m  [████████████████████]  100.0%  (n=1)
+    0.5–1.0m  [███████████░░░░░░░░░]   55.6%  (n=9)
+    1.0–1.5m  [██████████░░░░░░░░░░]   52.9%  (n=17)
+    1.5–3.0m  [██████████░░░░░░░░░░]   50.0%  (n=16)
+════════════════════════════════════════════════════════════════════

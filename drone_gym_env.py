@@ -190,15 +190,20 @@ _C_RW_INIT, _C_RW_TGT = 0.001, 0.05  # angular velocity ‖ω‖²
 _C_RA_INIT, _C_RA_TGT = 0.005, 0.02  # action-change regularisation ‖Δa‖²
 
 _C_RQ = 0.10   # orientation cost  (1 − qw²)  — fixed
-_C_RS = 0.50   # survival bonus per step       — fixed
+_C_RS = 10   # survival bonus per step       — fixed
 
 # Approach / hover shaping constants
 _APPROACH_COEF      = 1.0   # potential-shaping weight (was 2.0 — reduced to curb overshoot)
 # _APPROACH_COEF      = 0   # potential-shaping weight (reduced from 1.0 to curb overshoot)
-_APPROACH_GATE      = 0.10  # m — suppress approach reward inside this radius to stop oscillation
-_HOVER_BONUS        = 0.15  # per-step bonus for settling at target (halved from 0.30)
+_APPROACH_GATE      = 0.15  # m — suppress approach reward inside this radius to stop oscillation
+# _HOVER_BONUS        = 0.15  # per-step bonus for settling at target (halved from 0.30)
 # _HOVER_BONUS        = 0.0   # per-step bonus for settling at target (disabled to simplify reward)
-_HOVER_SPEED_GATE   = 0.5   # m/s — must be slow to earn hover bonus; stops rush-to-target
+# _HOVER_SPEED_GATE   = 0.5   # m/s — must be slow to earn hover bonus; stops rush-to-target
+
+# ── Hover-stabilization reward (new) ────────────────────────────────────────
+_C_HOVER_RPM   = 0.15   # penalty for motor RPM deviation from CF_HOVER_RPM
+_C_HOVER_ACTION = 0.10  # penalty for action deviation from 0 (hover point)
+_C_HOVER_BONUS = 0.20   # per-step bonus when actively hovering (position stable + low velocity + correct RPM)
 
 
 # ── Propeller physics (Level 5.1 — direct RPM) ───────────────────────────
@@ -505,11 +510,11 @@ class DroneEnv(gymnasium.Env):
         act_c    = -C_ra  * float(np.dot(delta_a,   delta_a))
         survival =  _C_RS
 
-        crash = -2.0 if z < 0.05 else 0.0
+        crash = -8.0 if z < 0.05 else 0.0
 
         arrival = 0.0
         if dist < 0.15 and not self._arrived:
-            arrival = 15.0
+            arrival = 60.0
             self._arrived = True
             if self._multi_target and self._random_targets:
                 self.set_target(_sample_random_target(self.np_random))
@@ -521,13 +526,25 @@ class DroneEnv(gymnasium.Env):
             if dist > _APPROACH_GATE else 0.0
         )
 
-        # Dense bonus for settling at the target.
-        # Gated on speed so the policy must decelerate before earning it —
-        # a pure distance gate rewards rushing through the target at high speed.
-        speed = float(np.linalg.norm(v))
-        hover_bonus = _HOVER_BONUS if (dist < 0.15 and speed < _HOVER_SPEED_GATE) else 0.0
+        # ── Hover stabilization reward ────────────────────────────────────────
+        # Penalize deviation from hover RPM: this keeps motors at the correct speed to maintain altitude
+        rpm_deviation = np.abs(self._motor_rpms - CF_HOVER_RPM).mean()  # average deviation across 4 motors
+        hover_rpm_penalty = -_C_HOVER_RPM * float(rpm_deviation / CF_HOVER_RPM)  # normalized penalty
+        
+        # Penalize action deviation from 0 (which corresponds to hover RPM)
+        # This encourages the policy to use action ≈ 0 when hovering
+        hover_action_penalty = -_C_HOVER_ACTION * float(np.dot(action, action))
+        
+        # Bonus for actively hovering: when drone is stable at target with low velocity
+        # This rewards steady hovering behavior rather than rapid movement
+        hover_bonus = 0.0
+        if dist < 0.20 and np.linalg.norm(v) < 0.5:  # close to target, moving slowly
+            # Smooth bonus based on how close to hover action (0) the agent is
+            action_magnitude = np.linalg.norm(action)
+            hover_bonus = _C_HOVER_BONUS * max(0.0, 1.0 - action_magnitude * 2.0)
 
-        reward = pos_c + orient_c + vel_c + ang_c + act_c + survival + crash + arrival + approach + hover_bonus
+        reward = pos_c + orient_c + vel_c + ang_c + act_c + survival + crash + arrival + approach + hover_rpm_penalty + hover_action_penalty + hover_bonus 
+        # reward = pos_c + orient_c + vel_c + ang_c + act_c + survival + crash + arrival + approach 
 
         # ── Termination ───────────────────────────────────────────────────
         terminated = bool(
@@ -551,14 +568,16 @@ class DroneEnv(gymnasium.Env):
             "z":       z,
             "motor_rpms": self._motor_rpms.tolist(),
             "reward_components": {
-                "pos_c":      pos_c,
-                "orient_c":   orient_c,
-                "vel_c":      vel_c,
-                "ang_c":      ang_c,
-                "act_c":      act_c,
-                "survival":   survival,
-                "approach":   approach,
-                "hover_bonus": hover_bonus,
+                "pos_c":              pos_c,
+                "orient_c":           orient_c,
+                "vel_c":              vel_c,
+                "ang_c":              ang_c,
+                "act_c":              act_c,
+                "survival":           survival,
+                "approach":           approach,
+                "hover_rpm_penalty":  hover_rpm_penalty,
+                "hover_action_penalty": hover_action_penalty,
+                "hover_bonus":        hover_bonus,
             },
         }
         if terminated or truncated:

@@ -10,8 +10,8 @@
 # asymmetric actor-critic (critic sees privileged sim state).
 #
 # This file replicates the paper's TD3 setup as closely as possible with
-# SB3/sbx, then uses the identical environment and curriculum to train
-# PPO (on-policy) and SAC (off-policy + entropy) for comparison.
+# stable_baselines3, then uses the identical environment and curriculum to
+# train PPO (on-policy) and SAC (off-policy + entropy) for comparison.
 #
 # Key differences from the paper:
 #   - No asymmetric actor-critic: critic sees the same 22-D obs as actor.
@@ -19,12 +19,13 @@
 #   - Partial domain randomisation: spawn pos/vel/angular-rate via curriculum;
 #     optional spawn orientation (roll/pitch ±15°) and multi-waypoint training.
 #     No external disturbance forces.
-#   - RLtools → sbx (JAX) for TD3/SAC; SB3 for PPO.
+#   - All algorithms use stable_baselines3 (PyTorch, CUDA).
 #
 # Usage:
 #   python train_drone.py --algo td3 --seed 0        # paper baseline
 #   python train_drone.py --algo sac --seed 0
 #   python train_drone.py --algo ppo --seed 0
+#   python train_drone.py --algo ppo --policy gru    # recurrent PPO (LSTM)
 #   python train_drone.py --algo td3 --seed 1        # different seed
 #   python train_drone.py --algo td3 --headless      # no OpenGL
 #   python train_drone.py --algo td3 --obs_noise     # sensor noise
@@ -32,22 +33,21 @@
 # TensorBoard (compare all runs):
 #   tensorboard --logdir drone_logs
 #
-# Each run logs as  drone_logs/<algo>/<algo>_s<seed>_<timestamp>/
-# so seeds and algorithms are separated cleanly in the UI.
+# Each run logs as  drone_logs/<algo>/<algo>_<policy>_s<seed>_<timestamp>/
+# so seeds, algorithms, and policy types are separated cleanly in the UI.
 #
-# TD3  → sbx (off-policy, JAX — matches paper algorithm)
-# SAC  → sbx (off-policy, JAX — entropy-regularised variant)
-# PPO  → stable_baselines3 (on-policy — expected weaker at Level 5.1)
+# TD3  → stable_baselines3 (off-policy, PyTorch — matches paper algorithm)
+# SAC  → stable_baselines3 (off-policy, PyTorch — entropy-regularised variant)
+# PPO  → stable_baselines3 (mlp) / sb3_contrib.RecurrentPPO (gru/LSTM)
 ###########################################################################
 
 import os
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.45")
 
 import math
 import random
 from collections import deque
 
+import torch as th
 import numpy as np
 import warp as wp
 
@@ -210,7 +210,7 @@ class RenderCallback(BaseCallback):
 class MetricsCallback(BaseCallback):
     """Logs per-episode metrics and reward components to TensorBoard."""
 
-    _RC_KEYS = ("pos_c", "orient_c", "vel_c", "ang_c", "act_c", "survival", "approach", "hover_bonus")
+    _RC_KEYS = ("pos_c", "orient_c", "vel_c", "ang_c", "act_c", "survival", "approach", "hover_rpm_penalty", "hover_action_penalty", "hover_bonus")
 
     def __init__(
         self,
@@ -319,12 +319,26 @@ def main() -> None:
     parser.add_argument("--algo",            type=str,   default="td3",
                         choices=["ppo", "sac", "td3"],
                         help="RL algorithm (td3 matches the paper).")
+    parser.add_argument("--policy",          type=str,   default="mlp",
+                        choices=["mlp", "gru"],
+                        help="Policy architecture: mlp (standard feedforward) or gru "
+                             "(recurrent LSTM via sb3_contrib.RecurrentPPO). "
+                             "GRU is only supported for PPO; SAC/TD3 always use MLP.")
     parser.add_argument("--seed",            type=int,   default=0,
                         help="Global random seed. Run multiple seeds to measure variance.")
+<<<<<<< Updated upstream
+    parser.add_argument("--num_envs",        type=int,   default=16)
+=======
+<<<<<<< Updated upstream
     parser.add_argument("--num_envs",        type=int,   default=128)
+>>>>>>> Stashed changes
     parser.add_argument("--total_timesteps",  type=int,   default=3_000_000,
+=======
+    parser.add_argument("--num_envs",        type=int,   default=256)
+    parser.add_argument("--total_timesteps",  type=int,   default=20_000_000,
+>>>>>>> Stashed changes
                         help="Total env steps (paper uses 3M for position control).")
-    parser.add_argument("--curriculum_steps", type=int,   default=1_500_000,
+    parser.add_argument("--curriculum_steps", type=int,   default=5_000_000,
                         help="Steps over which curriculum ramps 0→1 (default 1.5M). "
                              "Kept fixed so extending --total_timesteps doesn't slow the ramp.")
     parser.add_argument("--target_success",   type=float, default=1.0,
@@ -333,7 +347,7 @@ def main() -> None:
     parser.add_argument("--lr_final",         type=float, default=None,
                         help="If set, linearly decay LR from --learning_rate to this value. "
                              "Useful for fine-tuning in long runs (e.g. 1e-5 for 10M steps).")
-    parser.add_argument("--checkpoint_freq",  type=int,   default=500_000)
+    parser.add_argument("--checkpoint_freq",  type=int,   default=1_000_000)
     parser.add_argument("--render_freq",      type=int,   default=5_000)
     parser.add_argument("--checkpoint_dir",   type=str,   default="checkpoints")
     parser.add_argument("--learning_rate",    type=float, default=3e-4)
@@ -375,7 +389,7 @@ def main() -> None:
         def _init():
             env = DroneEnv(
                 render_mode=None, viewer=None,
-                random_targets=True,
+                random_targets=False,
                 multi_target=args.multi_target,
                 obs_noise=args.obs_noise,
                 curriculum=0.0,
@@ -389,7 +403,7 @@ def main() -> None:
     # ── Model ─────────────────────────────────────────────────────────────
     # Run name encodes algo + seed so every TensorBoard curve is uniquely
     # identified without ambiguity when comparing across algorithms/seeds.
-    run_name = f"{algo}_s{args.seed}"
+    run_name = f"{algo}_{args.policy}_s{args.seed}"
     tb_log   = "./drone_logs/"
 
     # LR schedule: constant if --lr_final not set; linear decay otherwise.
@@ -414,21 +428,42 @@ def main() -> None:
 
     # ── Build or load model ───────────────────────────────────────────────
     if algo == "ppo":
-        from stable_baselines3 import PPO
+        if args.policy == "gru":
+            from sb3_contrib import RecurrentPPO as PPO
+            ppo_policy = "MlpLstmPolicy"
+        else:
+            from stable_baselines3 import PPO
+            ppo_policy = "MlpPolicy"
         if resume_path:
             model = PPO.load(resume_path, env=train_env)
+<<<<<<< Updated upstream
             model.learning_rate    = learning_rate
             model.tensorboard_log  = tb_log
+<<<<<<< Updated upstream
+=======
             if model.num_timesteps < resume_steps:
                 model.num_timesteps = resume_steps
+=======
+            model.learning_rate   = learning_rate
+            model.tensorboard_log = tb_log
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
         else:
             model = PPO(
-                "MlpPolicy", train_env,
+                ppo_policy, train_env,
                 verbose=1,
                 seed=args.seed,
                 learning_rate=learning_rate,
                 n_steps=2048,
+<<<<<<< Updated upstream
+                batch_size=64,
+=======
+<<<<<<< Updated upstream
                 batch_size=512,
+=======
+                batch_size=1024,
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
                 n_epochs=10,
                 gamma=args.gamma,
                 gae_lambda=0.95,
@@ -436,17 +471,31 @@ def main() -> None:
                 ent_coef=0.02,
                 vf_coef=0.3,
                 max_grad_norm=0.5,
-                policy_kwargs=dict(net_arch=[256, 256]),
+                policy_kwargs=dict(
+                    net_arch=[256, 256],
+                    activation_fn=th.nn.Tanh,
+                ),
                 tensorboard_log=tb_log,
+                device="cuda",
             )
     elif algo == "sac":
-        from sbx import SAC
+        if args.policy == "gru":
+            print("  [warn] --policy gru is not supported for SAC; using mlp.")
+        from stable_baselines3 import SAC
         if resume_path:
             model = SAC.load(resume_path, env=train_env)
+<<<<<<< Updated upstream
             model.learning_rate    = learning_rate
             model.tensorboard_log  = tb_log
+<<<<<<< Updated upstream
+=======
             if model.num_timesteps < resume_steps:
                 model.num_timesteps = resume_steps
+=======
+            model.learning_rate   = learning_rate
+            model.tensorboard_log = tb_log
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
         else:
             model = SAC(
                 "MlpPolicy", train_env,
@@ -460,22 +509,37 @@ def main() -> None:
                 ent_coef=0.005,
                 train_freq=1,
                 gradient_steps=1,
-                policy_kwargs=dict(net_arch=[256, 256]),
+                policy_kwargs=dict(
+                    net_arch=[256, 256],
+                    activation_fn=th.nn.Tanh,
+                ),
                 tensorboard_log=tb_log,
+                device="cuda",
             )
     else:  # td3
-        from sbx import TD3
+        if args.policy == "gru":
+            print("  [warn] --policy gru is not supported for TD3; using mlp.")
+        from stable_baselines3 import TD3
         action_noise = NormalActionNoise(
             mean=np.zeros(train_env.action_space.shape),
             sigma=0.10 * np.ones(train_env.action_space.shape),
         )
         if resume_path:
             model = TD3.load(resume_path, env=train_env)
+<<<<<<< Updated upstream
             model.learning_rate    = learning_rate
             model.tensorboard_log  = tb_log
             model.action_noise     = action_noise
+<<<<<<< Updated upstream
+=======
             if model.num_timesteps < resume_steps:
                 model.num_timesteps = resume_steps
+=======
+            model.learning_rate   = learning_rate
+            model.tensorboard_log = tb_log
+            model.action_noise    = action_noise
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
         else:
             model = TD3(
                 "MlpPolicy", train_env,
@@ -492,8 +556,12 @@ def main() -> None:
                 policy_delay=2,
                 target_policy_noise=0.2,
                 target_noise_clip=0.5,
-                policy_kwargs=dict(net_arch=[256, 256]),
+                policy_kwargs=dict(
+                    net_arch=[256, 256],
+                    activation_fn=th.nn.Tanh,
+                ),
                 tensorboard_log=tb_log,
+                device="cuda",
             )
 
     # ── Callbacks ─────────────────────────────────────────────────────────
@@ -529,8 +597,9 @@ def main() -> None:
     resume_str = (f"resuming from step {steps_done:,} (+{steps_left:,} remaining)"
                   if resume_path else "fresh run")
     print(
-        f"\n  algo={algo.upper()}  seed={args.seed}  target={args.total_timesteps:,}  "
-        f"envs={args.num_envs}  viewer={'off' if viewer is None else 'on'}\n"
+        f"\n  algo={algo.upper()}  policy={args.policy}  seed={args.seed}  "
+        f"target={args.total_timesteps:,}  envs={args.num_envs}  "
+        f"viewer={'off' if viewer is None else 'on'}\n"
         f"  {resume_str}\n"
         f"  curriculum_steps={args.curriculum_steps:,}  lr={lr_str}  "
         f"early_stop={stop_str}  obs_noise={args.obs_noise}  multi_target={args.multi_target}\n"
@@ -556,7 +625,7 @@ def main() -> None:
             reset_num_timesteps=resume_path is None,
         )
 
-    save_path = f"{algo}_drone_final_s{args.seed}"
+    save_path = f"{algo}_{args.policy}_drone_final_s{args.seed}"
     model.save(save_path)
     print(f"\nSaved → {save_path}.zip")
     train_env.close()
