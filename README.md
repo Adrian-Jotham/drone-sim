@@ -1,16 +1,29 @@
-# Drone RL — End-to-End Quadrotor Navigation with PPO
+# Drone RL — GPU-Parallel Quadrotor Navigation (Newton/MuJoCo + SKRL)
 
 A reinforcement learning system for training a Crazyflie 2.x quadrotor position
-controller entirely inside the [Newton](https://github.com/newton-physics/newton)
-GPU-native rigid-body simulator using **Proximal Policy Optimization (PPO)**.
+controller **massively in parallel** inside the
+[Newton](https://github.com/newton-physics/newton) GPU-native simulator, using
+**SKRL** (PPO and SAC, with MLP or GRU policies).
 
-The environment models a real **Crazyflie 2.x** (27 g nano-quadrotor) with correct
-mass, inertia, arm length, and **Level-5.1 direct RPM control** — the lowest-level,
-most physically accurate action abstraction, exposing the full nonlinear thrust curve,
-motor lag, and inertia tensor to the policy.
+The drone is modelled as a generalized-coordinate articulation — a `FREE` airframe +
+**4 physical `REVOLUTE` rotor joints** (with `armature` / `effort_limit` / `friction`) —
+stepped by **`SolverMuJoCo`**. One model holds **N worlds** (default 4096) via
+`builder.replicate`; all per-step I/O stays on the GPU (no `.numpy()` syncs), and the
+substep loop is captured as a CUDA graph. A batched Warp kernel converts rotor ω into
+axial thrust + drag torque, so roll/pitch moments and the yaw reaction emerge from the
+physics automatically.
+
+The physics models a real **Crazyflie 2.x** (27 g nano-quadrotor) with correct mass,
+inertia, arm length, thrust/torque constants, motor lag (τ = 0.15 s), and 100 Hz control.
+Action remains the hover-centred 4-D `[-1, 1]` setpoint (0 → hover); observation remains
+the 22-D layout; reward and curriculum follow the paper.
 
 Physics baseline: Eschmann et al., "Learning to Fly in Seconds", RAL 2024 —
-system-identified Crazyflie parameters, Level-5.1 taxonomy, motor LPF model.
+system-identified Crazyflie parameters, motor LPF model.
+
+> **Migrated from** a single-body, CPU-bound Stable-Baselines3 pipeline. The old
+> `.zip` SB3 checkpoints are archival and **cannot** be loaded by the SKRL trainer.
+> See [CLAUDE.md](CLAUDE.md) for the full migration rationale.
 
 ---
 
@@ -18,56 +31,202 @@ system-identified Crazyflie parameters, Level-5.1 taxonomy, motor LPF model.
 
 ```
 dronesim/
-├── drone_gym_env.py          # Gymnasium environment (physics + obs + reward)
-├── train_drone.py            # Unified training script: PPO | SAC | TD3
-├── eval_trajectory.py        # Trajectory evaluation — waypoint chaining
-├── eval_drone.py             # Legacy per-episode evaluation (4-waypoint fixed)
-├── LearningtoFlyinSeconds.pdf # Reference paper (Eschmann 2024)
-├── landing/                  # Separate landing task environment
-│   ├── drone_landing_env.py
-│   ├── train_landing.py
-│   └── eval_landing.py
-├── disturbance/              # Hover task with random force/torque disturbances
-│   ├── quadrotor_hover_env.py
-│   ├── train_hover.py
-│   └── eval_hover.py
-└── drone_logs/               # TensorBoard logs (created at first training run)
-    ├── ppo/
-    ├── sac/
-    └── td3/
+├── drone_env_batched.py      # ★ Batched N-world Newton/MuJoCo env (build, aero,
+│                             #   actuation, obs/reward/reset kernels, CUDA graph)
+├── train_drone.py            # ★ SKRL trainer: PPO|SAC × MLP|GRU (+ SKRL env wrapper)
+├── skrl_models.py            # ★ Gaussian/Deterministic/Q models — MLP + GRU
+├── eval_drone.py             # ★ Multi-waypoint eval against the batched env + SKRL ckpt
+├── hover_test_batched.py     # ★ Hover sanity gate (run first — see "Verify")
+├── drone_gym_env.py          #   Single-env reference + the shared constants/config
+├── LearningtoFlyinSeconds.pdf #  Reference paper (Eschmann 2024)
+├── CLAUDE.md                 #   Migration spec / architecture rationale
+├── landing/  disturbance/    #   Out-of-scope sibling tasks (still SB3)
+└── runs/                     #   SKRL experiment dirs (TensorBoard + checkpoints)
+    └── <algo>_<policy>_s<seed>/
+        ├── events.out.tfevents…       # TensorBoard
+        └── checkpoints/
+            ├── best_agent.pt          # best by tracked reward
+            └── agent_<step>.pt        # periodic
 ```
+
+★ = the GPU-parallel pipeline. `★` files are the ones you run.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Train PPO — primary algorithm for this project
-python train_drone.py --algo ppo --headless --seed 0
+# 0. Sanity-check the physics first (must PASS before training)
+python hover_test_batched.py
 
-# Long run (40 M steps, overnight)
-python train_drone.py --algo ppo --headless --seed 1 \
-  --total_timesteps 40_000_000 \
-  --curriculum_steps 1_500_000
+# 1. Train PPO with an MLP policy at 4096 parallel worlds
+python train_drone.py --algo ppo --policy mlp --num_envs 4096 \
+  --total_timesteps 50_000_000 --seed 0
 
-# Resume from a checkpoint
-python train_drone.py --algo ppo --headless \
-  --resume checkpoints/ppo_s1_3000000_steps \
-  --total_timesteps 40_000_000
+# 2. Monitor
+tensorboard --logdir runs
 
-# Monitor training
-tensorboard --logdir drone_logs
-
-# Evaluate — waypoint chaining (primary evaluation)
-python eval_trajectory.py --model ppo_drone_final_s1 --algo ppo
-
-# Clean start (curriculum=0, upright stationary spawn)
-python eval_trajectory.py --model ppo_drone_final_s1 --algo ppo --clean_start
-
-# Square / Lissajous trajectories
-python eval_trajectory.py --model ppo_drone_final_s1 --algo ppo --traj square
-python eval_trajectory.py --model ppo_drone_final_s1 --algo ppo --traj lissajous
+# 3. Evaluate the best checkpoint on random multi-waypoint episodes
+python eval_drone.py --algo ppo --policy mlp \
+  --model runs/ppo_mlp_s0/checkpoints/best_agent.pt --num_episodes 20
 ```
+
+> Run everything with the env that has Newton + SKRL installed. On this machine:
+> `/home/adrian/miniconda3/envs/newton/bin/python` (the `newton` conda env).
+
+---
+
+## End-to-End Usage (Train → Evaluate)
+
+This is the full workflow in detail. The four algorithm/policy combinations
+— **PPO/SAC × MLP/GRU** — all share the same env, CLI, and checkpoint format.
+
+### Step 0 — Verify the simulator (do this first)
+
+`hover_test_batched.py` builds a small batch, commands the hover action (`a = 0`),
+and checks the drone holds altitude. It catches mass/inertia, thrust-conversion, and
+actuator-tuning bugs before you waste a training run.
+
+```bash
+python hover_test_batched.py
+```
+
+Expected tail:
+
+```
+hover thrust check: 4*KT_SI*ω² = 0.2649 N  vs m*g = 0.2649 N
+|ω| settled ~ 1516 rad/s (target hover 1515.9)
+altitude drift over 3 s: 0.020 m
+HOVER: PASS
+```
+
+If it prints `FAIL` (sinks or rockets), fix the physics before training — see
+[CLAUDE.md §8](CLAUDE.md).
+
+### Step 1 — Train
+
+```bash
+# General form
+python train_drone.py --algo {ppo,sac} --policy {mlp,gru} \
+  --num_envs 4096 --total_timesteps 50_000_000 --seed 0
+
+# Examples
+python train_drone.py --algo ppo --policy mlp                 # PPO + MLP (default)
+python train_drone.py --algo sac --policy mlp                 # SAC + MLP
+python train_drone.py --algo ppo --policy gru --num_envs 2048 # recurrent PPO
+python train_drone.py --algo sac --policy gru --num_envs 2048 # recurrent SAC
+```
+
+**CLI arguments**
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--algo` | `ppo` | `ppo` or `sac` |
+| `--policy` | `mlp` | `mlp` or `gru` (GRU → `PPO_RNN` / `SAC_RNN`) |
+| `--num_envs` | `4096` | parallel worlds (the one intended change vs the paper config) |
+| `--total_timesteps` | `50_000_000` | **environment frames** (`agent_steps = total / num_envs`) |
+| `--seed` | `0` | RNG seed; also names the run |
+| `--rollouts` | `24` | PPO steps/env per update (`rollouts × num_envs` = batch) |
+| `--buffer_size` | `500_000` | SAC replay capacity (total; sized per-env internally) |
+| `--curriculum_steps` | `5_000_000` | frames to ramp curriculum `c: 0 → 1` |
+| `--entropy_decay_steps` | `20_000_000` | frames to decay PPO entropy `0.02 → 5e-4` |
+| `--logdir` | `runs` | experiment root |
+| `--device` | `cuda` | compute device |
+| `--no_graph` | off | disable CUDA-graph capture (slower; for debugging) |
+
+**What it does:** builds one Newton model with `--num_envs` worlds, wraps it for SKRL,
+constructs the agent (PPO/SAC, MLP/GRU), and runs `SequentialTrainer`. A thin agent
+subclass ramps the curriculum, decays PPO entropy, and logs success metrics — all keyed
+on environment frames.
+
+**Output:** `runs/<algo>_<policy>_s<seed>/` containing TensorBoard events and
+`checkpoints/{best_agent.pt, agent_<step>.pt}`.
+
+> **GPU memory:** 4096 envs (esp. SAC, or any GRU) can exceed a small card.
+> If you hit `CUDA out of memory`, drop `--num_envs` (e.g. 2048 → 1024). The 8 GiB
+> laptop GPU here comfortably runs PPO/MLP at 4096 and the recurrent/SAC variants at
+> ~1024–2048.
+
+### Step 2 — Monitor
+
+```bash
+tensorboard --logdir runs
+```
+
+Key scalars (mirroring the old logging):
+
+| Tag | Meaning |
+|---|---|
+| `Reward / Instantaneous reward (mean)` | per-step reward across all worlds |
+| `Reward / Total reward (mean)` | cumulative episode return (mean over finished episodes) |
+| `Episode / success_rate` | fraction of finished episodes with terminal `dist < 0.15 m` |
+| `Episode / terminal_dist` | mean distance to target at episode end |
+| `Curriculum / c` | curriculum scalar `0 → 1` |
+| `Curriculum / entropy_scale` | PPO entropy coefficient (decaying) |
+
+A healthy PPO/MLP run: reward climbs as `c` ramps, `success_rate` rises past ~0.5 once
+the curriculum saturates. Convergence takes tens of millions of frames (minutes-to-hours
+depending on `--num_envs` and GPU).
+
+### Step 3 — Evaluate
+
+`eval_drone.py` loads a checkpoint and flies **random multi-waypoint episodes** on the
+batched env (1 world): the drone visits each waypoint in sequence *without* resetting
+between them; a slot succeeds at `dist < 0.15 m`.
+
+```bash
+python eval_drone.py --algo ppo --policy mlp \
+  --model runs/ppo_mlp_s0/checkpoints/best_agent.pt \
+  --num_episodes 20 --waypoints_per_ep 4
+
+# Recurrent policy — match --algo/--policy to how the checkpoint was trained
+python eval_drone.py --algo sac --policy gru \
+  --model runs/sac_gru_s0/checkpoints/best_agent.pt
+```
+
+**Eval arguments:** `--model` (checkpoint `.pt`, required), `--algo`, `--policy`
+(must match training), `--num_episodes` (10), `--waypoints_per_ep` (4),
+`--steps_per_wp` (200), `--seed` (42), `--device` (`cuda`).
+
+The policy runs **deterministically** (uses the action mean); GRU hidden state is
+carried within an episode and reset between episodes. Output is a per-episode log plus a
+summary (mean reward, per-waypoint & all-waypoint success, mean waypoint distance, mean
+motor RPM).
+
+> The eval reconstructs the *same* agent as training and calls `agent.load(...)`, so
+> `--algo` and `--policy` **must** match the checkpoint. The old SB3 `.zip` files are not
+> loadable here.
+
+### Real-time visualization (OpenGL)
+
+Both training and eval can open a live **Newton GL viewer** (CUDA/OpenGL interop — the
+sim state is uploaded GPU→GPU each frame). The viewer renders a chosen subset of worlds
+in a grid (display-only offsets; the physics is unaffected) plus a sphere marker at each
+world's current target. Requires a display (`$DISPLAY`).
+
+```bash
+# Watch training — a 9-world grid, one frame every 4 control steps
+python train_drone.py --algo ppo --policy mlp --num_envs 4096 \
+  --render --render_worlds 9 --render_every 4
+
+# Watch a trained policy fly, paced to wall-clock 100 Hz
+python eval_drone.py --algo ppo --policy mlp \
+  --model runs/ppo_mlp_s0/checkpoints/best_agent.pt --render --realtime
+```
+
+| Flag | Where | Meaning |
+|---|---|---|
+| `--render` | train + eval | open the GL window |
+| `--render_worlds N` | train | how many worlds to show in the grid (default 4) |
+| `--render_every K` | train | draw one frame per K control steps (default 4; throttles overhead) |
+| `--realtime` | eval | sleep so playback matches wall-clock 100 Hz |
+
+Notes:
+- `log_state` synchronizes the device each rendered frame, so rendering throttles
+  throughput — keep `--render` for **watching**, drop it for fast headless training.
+- Training runs faster than real time, so the grid fast-forwards; closing the window
+  stops rendering but lets training continue headless.
+- The drone shows as its cross-arm collision shapes; the orange sphere is the target.
 
 ---
 
@@ -82,7 +241,7 @@ python eval_trajectory.py --model ppo_drone_final_s1 --algo ppo --traj lissajous
                  │  Level-5.1 RPM     n[t+1]=…        Crazyflie 27 g   │
                  └──────────────────────────────────────────────────────┘
                           ▲                                  │
-                          │    RL Policy (PPO / SAC / TD3)   │
+                          │    RL Policy (PPO / SAC)         │
                           └──────────────────────────────────┘
 ```
 
@@ -225,7 +384,8 @@ observability of the delayed RPM.
 
 ### Optional observation noise
 
-When training with `--obs_noise`, Gaussian noise simulates imperfect onboard sensors:
+The single-env reference (`drone_gym_env.py`) can add Gaussian sensor noise to the
+observation (the batched trainer keeps it off by default):
 
 | Component | Noise σ |
 |-----------|---------|
@@ -484,12 +644,12 @@ curriculum the heavy early position penalty makes crashing at step 1 "optimal" f
 the initial random policy.
 
 ```python
-# train_drone.py — CurriculumCallback._on_step()
-t = min(num_timesteps / curriculum_steps, 1.0)
-# curriculum_steps default: 1_500_000 (fixed absolute count — see --curriculum_steps)
+# train_drone.py — agent pre_interaction hook
+c = min(env_frames / curriculum_steps, 1.0)   # env_frames = timestep × num_envs
+# --curriculum_steps default: 5_000_000 frames (fixed absolute count)
 ```
 
-Disable with `--no_curriculum` for ablation experiments.
+The curriculum is always on; control its length with `--curriculum_steps`.
 
 ---
 
@@ -508,208 +668,128 @@ Episodes also truncate after `MAX_EPISODE_STEPS = 800` steps (8.0 s at 100 Hz).
 
 ## Reinforcement Learning Algorithms
 
-Three algorithms are supported. **PPO is the primary algorithm for this project.**
+Two algorithms × two policy backbones, all from **SKRL** (PyTorch, GPU-native):
+**PPO** / **SAC**, each with an **MLP** or a **GRU** policy (GRU → `PPO_RNN` / `SAC_RNN`).
+TD3 was dropped in the migration. Models live in `skrl_models.py`; head is `[256, 256]`
+with `Tanh` (matching the old config). Hyperparameters are mapped from the preserved
+SB3 config and set in `train_drone.py` (`build_ppo_cfg` / `build_sac_cfg`).
 
-### PPO — Proximal Policy Optimisation (`stable_baselines3`)
+### PPO — Proximal Policy Optimisation (`skrl.agents.torch.ppo`)
 
-**Type:** On-policy
-**Best for:** Stable long-run training with reproducible convergence.
+On-policy. Default policy. Maps to `PPO_CFG`:
 
-| Hyperparameter | Value | Rationale |
+| SKRL cfg key | Value | Old SB3 equivalent |
 |---|---|---|
-| `n_steps` | 2048 | Steps per env per rollout; 2048 × 16 envs = 32,768 transitions/rollout. Exceeds MAX_EPISODE_STEPS=800 so complete episodes always fit in one rollout — no GAE truncation mid-episode. |
-| `batch_size` | 64 | Mini-batch size; 512 mini-batches per rollout |
-| `n_epochs` | 10 | Gradient passes per rollout |
-| `gamma` | 0.99 | Discount factor |
-| `gae_lambda` | 0.95 | GAE bias-variance trade-off |
-| `clip_range` | 0.2 | PPO trust-region clip (ratio clamped to [0.8, 1.2]) |
-| `ent_coef` | 0.005 | Entropy bonus; keeps exploration from collapsing |
-| `vf_coef` | 0.5 | Value function loss weight |
-| `max_grad_norm` | 0.5 | Gradient clipping for stability |
-| `net_arch` | [256, 256] | Two hidden layers, tanh activations |
-| `learning_rate` | 3e-4 | Adam learning rate (constant unless `--lr_final` set) |
+| `rollouts` | `--rollouts` (24) | `n_steps` (per env); batch = `rollouts × num_envs` |
+| `mini_batches` | `rollouts·N // 16384` | preserves the effective minibatch size |
+| `learning_epochs` | 10 | `n_epochs` |
+| `discount_factor` | 0.99 | `gamma` |
+| `gae_lambda` | 0.95 | `gae_lambda` |
+| `ratio_clip` / `value_clip` | 0.3 | `clip_range` |
+| `entropy_loss_scale` | 0.02 → 5e-4 (decayed) | `ent_coef` schedule |
+| `value_loss_scale` | 0.3 | `vf_coef` |
+| `grad_norm_clip` | 0.5 | `max_grad_norm` |
+| `learning_rate` | 3e-4 | `learning_rate` |
+| `observation_preprocessor` | `RunningStandardScaler` | obs normalisation |
 
-### SAC — Soft Actor-Critic (`sbx`, JAX)
+### SAC — Soft Actor-Critic (`skrl.agents.torch.sac`)
 
-**Type:** Off-policy, entropy-regularised
+Off-policy, entropy-regularised. Models: Gaussian policy + twin Q-critics + targets.
+Maps to `SAC_CFG`:
 
-| Hyperparameter | Value |
-|---|---|
-| `buffer_size` | 500 000 |
-| `batch_size` | 256 |
-| `learning_starts` | 0 |
-| `tau` | 0.005 |
-| `ent_coef` | 0.005 (fixed, not auto) |
-| `net_arch` | [256, 256] |
+| SKRL cfg key | Value | Old SB3 equivalent |
+|---|---|---|
+| `batch_size` | 256 | `batch_size` |
+| `polyak` | 0.005 | `tau` |
+| `discount_factor` | 0.99 | `gamma` |
+| `learn_entropy` | `True` (auto) | `ent_coef="auto"` |
+| `learning_starts` | 1000 | warm-up before updates |
+| `learning_rate` | 3e-4 | actor/critic/entropy LR |
+| replay capacity | `--buffer_size` (500 000) | `buffer_size`, sized per-env internally |
 
-**Why fixed `ent_coef` for SAC:** SAC's `ent_coef="auto"` targets `H = −dim(action) = −4`
-nats, forcing σ ≈ 1.0 per dimension = ±7 200 RPM noise. The drone thrashes between
-full throttle and motor stall. Using `ent_coef=0.005` (fixed) keeps entropy as a mild
-regulariser without overwhelming the task reward.
+### MLP vs GRU
 
-### TD3 — Twin Delayed Deep Deterministic (`sbx`, JAX)
-
-**Type:** Off-policy, deterministic
-
-| Hyperparameter | Value |
-|---|---|
-| `buffer_size` | 500 000 |
-| `batch_size` | 256 |
-| `learning_starts` | 0 |
-| `tau` | 0.005 |
-| `policy_delay` | 2 |
-| `target_policy_noise` | 0.2 |
-| `target_noise_clip` | 0.5 |
-| `action_noise σ` | 0.10 → 0.02 (decayed by CurriculumCallback) |
-| `net_arch` | [256, 256] |
-
-**Why `learning_starts = 0` for TD3:** With `learning_starts=10_000`, SBX fills the
-buffer with uniform random actions in [−1, 1] during warm-up. At Level-5.1 RPM
-control that means random RPMs from 7 250 to 21 702 — the drone crashes almost every
-episode. Q-networks then learn that all (state, action) pairs lead to crashes, making
-the policy pessimistic (outputs below-hover RPMs → sinks).
-
-With `learning_starts=0`, a randomly-initialised MLP with tanh outputs ≈ 0, which
-maps to ≈ hover RPM. The drone stays airborne from episode 1, the buffer fills with
-useful hovering experience, and Q-values remain optimistic. Action noise σ=0.10
-adds ±723 RPM variation — enough to explore without causing immediate crashes.
-
-### Algorithm Comparison
-
-```
-Primary algorithm: PPO (this project)
-Sample efficiency:  SAC ≈ TD3 >> PPO
-Stability:          PPO > TD3 ≈ SAC (at Level 5.1 with this reward shaping)
-Wall-clock (GPU):   SBX (SAC/TD3) >> SB3 (PPO)  — JAX vs PyTorch
-```
+- **MLP** — fast, the default; the 22-D obs is Markov enough for position control.
+- **GRU** — a single GRU (hidden 256) in front of the head; implements SKRL's RNN
+  contract (`get_specification` + hidden-state passing + per-episode resets). Use it for
+  partial-observability / sim2real robustness experiments. Costs more memory — reduce
+  `--num_envs` accordingly.
 
 ---
 
 ## Training
 
+Full command reference and the workflow are in
+[End-to-End Usage](#end-to-end-usage-train--evaluate) above. This section adds detail on
+output layout and the curriculum/entropy schedules.
+
 ### Basic usage
 
 ```bash
-# PPO — 3 M steps (baseline)
-python train_drone.py --algo ppo --headless --seed 0
-
-# PPO — 40 M steps (converged policy)
-python train_drone.py --algo ppo --headless --seed 1 \
-  --total_timesteps 40_000_000 \
-  --curriculum_steps 1_500_000
-
-# With sensor noise
-python train_drone.py --algo ppo --headless --obs_noise
+python train_drone.py --algo ppo --policy mlp --num_envs 4096 \
+  --total_timesteps 50_000_000 --seed 0
 ```
 
-### All training arguments
-
-| Argument | Default | Description |
-|---|---|---|
-| `--algo` | `td3` | Algorithm: `ppo`, `sac`, or `td3` |
-| `--seed` | `0` | Global random seed. Each seed produces an independent run. Run name encoded as `{algo}_s{seed}`. |
-| `--num_envs` | `16` | Parallel training environments (DummyVecEnv — sequential, not threaded) |
-| `--total_timesteps` | `3 000 000` | Total environment steps |
-| `--curriculum_steps` | `1 500 000` | Steps over which curriculum ramps 0→1. Fixed absolute count, decoupled from `--total_timesteps`. |
-| `--target_success` | `1.0` | Early-stop when rolling 100-episode success rate exceeds this. `1.0` = never stop early. |
-| `--lr_final` | `None` | If set, linearly decay LR from `--learning_rate` to this value. E.g., `--lr_final 1e-5` for long runs. |
-| `--checkpoint_freq` | `500 000` | Save checkpoint every N global steps |
-| `--checkpoint_dir` | `checkpoints` | Directory for checkpoints |
-| `--resume` | `None` | Path to a checkpoint `.zip` to resume training from. |
-| `--learning_rate` | `3e-4` | Initial Adam learning rate |
-| `--gamma` | `0.99` | Discount factor |
-| `--render_freq` | `5 000` | Render update frequency (global steps) |
-| `--obs_noise` | off | Add Gaussian sensor noise to observations |
-| `--multi_target` | off | When the drone reaches a waypoint, immediately assign a new random one without physics reset. Forces the policy to learn repeated target-reaching within one episode. |
-| `--no_curriculum` | off | Disable reward curriculum (ablation: degrades reliability) |
-| `--headless` | off | No OpenGL viewer |
+See the CLI table in [Step 1 — Train](#step-1--train) for every flag.
 
 ### Run naming and output files
 
-Every run is named `{algo}_s{seed}`. TensorBoard logs go to `drone_logs/{algo}/{algo}_s{seed}_<timestamp>/`.
+Each run is named `{algo}_{policy}_s{seed}` and written under `--logdir` (default `runs/`):
 
 ```
-checkpoints/ppo_s1_500000_steps.zip
-checkpoints/ppo_s1_1000000_steps.zip
-...
-ppo_drone_final_s1.zip           ← final model
+runs/ppo_mlp_s0/
+├── events.out.tfevents…             ← TensorBoard
+└── checkpoints/
+    ├── best_agent.pt                ← best by tracked reward (use this for eval)
+    └── agent_<step>.pt              ← periodic snapshots
 ```
 
-Checkpoints save every `--checkpoint_freq` steps (default 500 000 global steps).
-The final model file includes the seed in its name for unambiguous identification.
+Checkpoints are SKRL `.pt` files (a dict of model + preprocessor state). They are **not**
+interchangeable with the old SB3 `.zip` files.
 
-### Resuming from a checkpoint
+> **Resuming:** SKRL's `SequentialTrainer` runs a fixed `timesteps` loop and does not
+> expose a `--resume` flag here. To continue training, load a checkpoint into a freshly
+> built agent (`agent.load(path)` — see `eval_drone.py` for the load pattern) before
+> calling `trainer.train()`; the SAC replay buffer is not saved.
 
-```bash
-# Resume from the 3 M step checkpoint and continue to 40 M
-python train_drone.py --algo ppo --headless \
-  --resume checkpoints/ppo_s1_3000000_steps \
-  --total_timesteps 40_000_000 \
-  --curriculum_steps 1_500_000
-```
+### Curriculum & entropy schedules
 
-`--resume` loads the policy weights, optimizer state, and step counter from the
-checkpoint zip. With `reset_num_timesteps=False` (set automatically), the curriculum,
-LR schedule, and early-stop window all continue correctly from the saved step count.
+Both are driven by **environment frames** (`timestep × num_envs`) inside the agent's
+`pre_interaction` hook:
 
-| What | Effect at resume |
-|---|---|
-| **Curriculum** | If `num_timesteps ≥ curriculum_steps` at load, curriculum stays at 1.0 immediately |
-| **LR schedule** | `progress_remaining = 1 − done/total`. LR is correct fraction of the way through the decay. |
-| **Early stop** | Rolling success window resets — stale pre-resume data does not trigger early stop |
-
-**Replay buffer note:** SAC and TD3 checkpoints do **not** include the replay buffer.
-Off-policy methods retrain with an empty buffer for the first ~50 k steps after resume.
-PPO is unaffected (no replay buffer).
+- **Curriculum** `c: 0 → 1` linearly over `--curriculum_steps` (default 5 M frames),
+  ramping reward weights *and* spawn extremes (position ±0.15→±1.5 m, tilt ±15°→±90°,
+  velocity/rate, and initial rotor-speed band). Logged as `Curriculum / c`.
+- **PPO entropy** decays `0.02 → 5e-4` over `--entropy_decay_steps` (default 20 M).
+  Logged as `Curriculum / entropy_scale`. (SAC learns its entropy automatically.)
 
 ### Spawn Randomisation
 
 The environment randomises the drone's initial state at every episode reset. All ranges
 grow linearly with the curriculum:
 
-| Dimension | Range at c=0 | Range at c=1 | Why |
+| Dimension | Range at c=0 | Range at c=1 | Curriculum law (per axis) |
 |-----------|-------------|-------------|-----|
-| **Position (XY, Z)** | ±0.1 m from target | ±0.7 m from target | `pos_range = 0.1 + 0.6 × curriculum` |
-| **Orientation (roll/pitch)** | 0° | ±15° | Forces policy to learn attitude stabilisation concurrent with navigation |
-| **Linear velocity** | 0 m/s | ±1.5 m/s (all axes) | Teaches braking and settling from arbitrary initial velocity |
-| **Angular velocity** | 0 rad/s | ±0.5 rad/s (body frame) | Forces the policy to damp oscillations it did not cause itself |
+| **Position (XY, Z)** | ±0.15 m from target | ±1.5 m from target | `0.15 + 1.35 × c` |
+| **Orientation (tilt)** | ±15° | ±90° (full SO(3) cap) | `15° + 75° × c`, area-uniform on the cap |
+| **Linear velocity** | ±0.1 m/s | ±1.0 m/s | `0.1 + 0.9 × c` |
+| **Angular velocity** | ±0.1 rad/s | ±1.0 rad/s | `0.1 + 0.9 × c` |
+| **Initial rotor speed** | ~hover band | 0 → MAX/2 band | widens with `c` |
 
-No yaw randomisation — yaw is always initialised to identity.
-
-At c = 0 (clean start) the drone spawns stationary and nearly upright within 0.1 m
-of the waypoint. At c = 1.0 (full randomisation) the drone may start with significant
-velocity, tilt, and angular rate.
-
-The spawn cap at ±0.7 m ensures the survival bonus (+0.5/step) always exceeds the
-position penalty (−C_rp × 0.49 = −0.49/step at full curriculum), keeping episode
-returns positive and giving PPO a learnable gradient from the first update.
-
-### Exploration Noise Decay (TD3)
-
-`CurriculumCallback` decays the TD3 action noise σ in lockstep with the reward
-curriculum:
-
-```
-σ(t) = 0.10  →  0.02   over first curriculum_steps
-```
-
-High initial noise allows exploration before reward weights tighten; low final noise
-allows precise RPM control once the curriculum is fully ramped.
-
-### TensorBoard monitoring
-
-```bash
-tensorboard --logdir drone_logs
-```
-
-| Group | Signals |
-|---|---|
-| `metrics/` | `ep_length`, `ep_reward`, `success_rate`, `terminal_dist`, `terminal_upright`, `mean_motor_rpm`, `rpm_hover_dev` |
-| `reward_components/` | `pos_c`, `orient_c`, `vel_c`, `ang_c`, `act_c`, `survival`, `approach`, `hover_bonus` |
+A fixed **10% "guidance" branch** (curriculum-independent) always spawns the drone at the
+target with identity attitude, supplying a steady stream of hold-at-target data. Yaw is
+sampled uniformly. All of this runs inside the batched `reset_kernel` (GPU), masked to the
+done envs each step.
 
 ---
 
-## PPO Training — How It Works
+## PPO Training — How It Works (legacy SB3 internals)
+
+> ⚠️ **The sections from here down describe the original single-body Stable-Baselines3
+> pipeline** (`DummyVecEnv`, 16 sequential envs, `metrics/…` tags, `eval_trajectory.py`).
+> They are kept for historical reference. For the current GPU-parallel SKRL pipeline use
+> [End-to-End Usage](#end-to-end-usage-train--evaluate). The physics/observation/reward/
+> curriculum sections above remain accurate.
 
 ### Stage 1 — Environment factory: 16 parallel worlds
 

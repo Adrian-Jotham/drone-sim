@@ -1,664 +1,278 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
+"""
+SKRL trainer for the GPU-parallel drone position controller (CLAUDE.md T7+T8).
 
-###########################################################################
-# Unified Drone Training — PPO | SAC | TD3
-#
-# Baseline: Eschmann et al., "Learning to Fly in Seconds", RAL 2024.
-# The paper trains TD3 (off-policy) at Level 5.1 (direct RPM control)
-# using curriculum learning, rotor delay, action history, and an
-# asymmetric actor-critic (critic sees privileged sim state).
-#
-# This file replicates the paper's TD3 setup as closely as possible with
-# stable_baselines3, then uses the identical environment and curriculum to
-# train PPO (on-policy) and SAC (off-policy + entropy) for comparison.
-#
-# Key differences from the paper:
-#   - No asymmetric actor-critic: critic sees the same 22-D obs as actor.
-#     (Paper critic sees 28-D: adds motor RPMs + random disturbances.)
-#   - Partial domain randomisation: spawn pos/vel/angular-rate via curriculum;
-#     optional spawn orientation (roll/pitch ±15°) and multi-waypoint training.
-#     No external disturbance forces.
-#   - All algorithms use stable_baselines3 (PyTorch, CUDA).
-#
-# Usage:
-#   python train_drone.py --algo td3 --seed 0        # paper baseline
-#   python train_drone.py --algo sac --seed 0
-#   python train_drone.py --algo ppo --seed 0
-#   python train_drone.py --algo ppo --policy gru    # recurrent PPO (LSTM)
-#   python train_drone.py --algo td3 --seed 1        # different seed
-#   python train_drone.py --algo td3 --headless      # no OpenGL
-#   python train_drone.py --algo td3 --obs_noise     # sensor noise
-#
-# TensorBoard (compare all runs):
-#   tensorboard --logdir drone_logs
-#
-# Each run logs as  drone_logs/<algo>/<algo>_<policy>_s<seed>_<timestamp>/
-# so seeds, algorithms, and policy types are separated cleanly in the UI.
-#
-# TD3  → stable_baselines3 (off-policy, PyTorch — matches paper algorithm)
-# SAC  → stable_baselines3 (off-policy, PyTorch — entropy-regularised variant)
-# PPO  → stable_baselines3 (mlp) / sb3_contrib.RecurrentPPO (gru/LSTM)
-###########################################################################
+Replaces the conflicted SB3 trainer. One Newton model with N worlds is driven by a
+single SKRL agent (PPO or SAC), with MLP or GRU policies. Hyperparameters are mapped
+from the preserved SB3 config (CLAUDE.md §6). A linear curriculum and PPO entropy decay
+are applied via a thin agent subclass; success/terminal-distance metrics mirror the old
+TensorBoard logging.
 
-import os
+Usage:
+    python train_drone.py --algo ppo --policy mlp --num_envs 4096 --total_timesteps 50_000_000
+    python train_drone.py --algo sac --policy gru --num_envs 2048 --seed 0
+"""
 
-import math
-import random
-from collections import deque
+from __future__ import annotations
 
-import torch as th
+import argparse
+
+import gymnasium
 import numpy as np
-import warp as wp
+import torch
 
-import newton
-import newton.examples
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
-from tqdm import tqdm as _tqdm
-from stable_baselines3.common.noise import NormalActionNoise
-from stable_baselines3.common.vec_env import DummyVecEnv
+import skrl
+from skrl.envs.wrappers.torch.base import Wrapper
+from skrl.memories.torch import RandomMemory
+from skrl.agents.torch.ppo import PPO, PPO_RNN, PPO_CFG
+from skrl.agents.torch.sac import SAC, SAC_RNN, SAC_CFG
+from skrl.trainers.torch import SequentialTrainer
+from skrl.resources.preprocessors.torch import RunningStandardScaler
 
-from drone_gym_env import (
-    DroneEnv, MAX_EPISODE_STEPS, FPS, SIM_DT,
-    CF_ARM, CF_HOVER_RPM,
-    _CRAZYFLIE_MESH_NAME, _load_crazyflie_mesh,
-)
-
-# Visual size for the fallback box when no CF mesh is available.
-# CF_ARM (32.5 mm) is too small to see; scale up for rendering only.
-_VIZ_SIZE = CF_ARM * 4.0   # ≈ 0.13 m — visible at training camera distance
+from drone_env_batched import BatchedDroneEnv, OBS_DIM, SUCCESS_R
+import skrl_models as M
 
 
-# ── Curriculum + noise-decay callback ────────────────────────────────────
+# ── SKRL env wrapper (T7) ─────────────────────────────────────────────────
 
-class CurriculumCallback(BaseCallback):
-    """Linearly ramps env.curriculum 0→1 over `curriculum_steps` absolute steps.
+class SkrlDroneWrapper(Wrapper):
+    """Thin SKRL wrapper over the batched Newton env (GPU tensors throughout)."""
 
-    Decoupled from total_timesteps so extending training to 10M steps does not
-    silently slow the curriculum ramp.  Default keeps the old behaviour:
-    1_500_000 steps  (= half of the original 3M default).
+    def __init__(self, env: BatchedDroneEnv):
+        super().__init__(env)
+        self._obs_space = gymnasium.spaces.Box(-np.inf, np.inf, (OBS_DIM,), np.float32)
+        self._act_space = gymnasium.spaces.Box(-1.0, 1.0, (env.num_act,), np.float32)
+        self._last_info: dict = {}
 
-    Also decays:
-      - TD3/SAC action noise from noise_init → noise_final
-      - PPO entropy coefficient from ent_init → ent_final (if provided)
-    over the same window, matching the paper's exploration-noise decay schedule
-    (paper Table 6 — for TD3; the PPO analogue is the entropy term).
-    """
+    @property
+    def num_envs(self) -> int:          return self._env.num_envs
+    @property
+    def observation_space(self):        return self._obs_space
+    @property
+    def action_space(self):             return self._act_space
+    @property
+    def state_space(self):              return None
+    @property
+    def unwrapped(self):                return self._env
 
-    def __init__(
-        self,
-        curriculum_steps: int,
-        noise_init:  float = 0.30,   # σ at training start (TD3/SAC)
-        noise_final: float = 0.05,   # σ after curriculum is fully ramped (TD3/SAC)
-        ent_init:    float | None = None,  # PPO ent_coef at start (None = no decay)
-        ent_final:   float | None = None,  # PPO ent_coef after curriculum
-        verbose: int = 0,
-    ):
-        super().__init__(verbose)
-        self._curriculum_steps = curriculum_steps
-        self._noise_init  = noise_init
-        self._noise_final = noise_final
-        self._ent_init    = ent_init
-        self._ent_final   = ent_final
+    def reset(self):
+        obs, info = self._env.reset()
+        return obs, info
 
-    def _on_step(self) -> bool:
-        t = min(self.num_timesteps / self._curriculum_steps, 1.0)
+    def step(self, actions: torch.Tensor):
+        obs, rew, term, trunc, info = self._env.step(actions)
+        self._last_info = info
+        return (obs,
+                rew.view(-1, 1),
+                term.view(-1, 1).to(torch.bool),
+                trunc.view(-1, 1).to(torch.bool),
+                info)
 
-        # Update curriculum in every training environment
-        for env in self.training_env.envs:
-            env.curriculum = t
-
-        # Decay action noise for TD3 (and SAC if it has explicit noise)
-        if hasattr(self.model, "action_noise") and self.model.action_noise is not None:
-            sigma = self._noise_init + t * (self._noise_final - self._noise_init)
-            self.model.action_noise._sigma = np.full(
-                self.model.action_space.shape, sigma, dtype=np.float32
-            )
-
-        # Decay PPO entropy coefficient (only if both endpoints are set and the
-        # model exposes ent_coef as a numeric value — SAC uses 'auto' by default).
-        if self._ent_init is not None and self._ent_final is not None:
-            ent_attr = getattr(self.model, "ent_coef", None)
-            if isinstance(ent_attr, (int, float)):
-                self.model.ent_coef = self._ent_init + t * (self._ent_final - self._ent_init)
-
-        return True
+    def state(self):                    return None
+    def render(self, *a, **k):          return None
+    def close(self):                    return None
 
 
-# ── Render callback ───────────────────────────────────────────────────────
+# ── Curriculum + entropy-decay + metric logging mix-in ────────────────────
 
-class RenderCallback(BaseCallback):
-    """Renders all parallel training envs in a grid every N steps."""
+def _make_agent_class(base):
+    """Subclass a SKRL agent to add curriculum ramp, entropy decay, custom metrics."""
 
-    GRID_SPACING = 4.0
+    class _Agent(base):
+        def configure_schedule(self, env, curriculum_steps, ent_start, ent_end, ent_steps):
+            self._cur_env = env
+            self._cur_steps = max(int(curriculum_steps), 1)
+            self._ent0, self._ent1 = ent_start, ent_end
+            self._ent_steps = max(int(ent_steps), 1)
+            self._has_entropy = hasattr(self.cfg, "entropy_loss_scale")
 
-    def __init__(self, viewer, train_vec_env, render_freq: int = 5_000, verbose: int = 0):
-        super().__init__(verbose)
-        self._viewer     = viewer
-        self._train_env  = train_vec_env
-        self.render_freq = render_freq
-        self._last_render = 0
-        self._render_t    = 0.0
-        n = train_vec_env.num_envs
-        self._grid_cols = max(1, math.ceil(math.sqrt(n)))
-        self._has_drone_mesh = False
-        if viewer is not None:
-            mesh = _load_crazyflie_mesh(CF_ARM)
-            if mesh is not None:
-                points, indices, normals = mesh
-                viewer.log_mesh(_CRAZYFLIE_MESH_NAME, points, indices, normals=normals)
-                self._has_drone_mesh = True
+        def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
+            # timestep is per-env agent steps; convert to environment frames.
+            frames = timestep * self._cur_env.num_envs
+            c = min(frames / self._cur_steps, 1.0)
+            self._cur_env.unwrapped.set_curriculum(c)
+            if self._has_entropy:
+                frac = min(frames / self._ent_steps, 1.0)
+                self.cfg.entropy_loss_scale = self._ent0 + frac * (self._ent1 - self._ent0)
+                self.track_data("Curriculum / entropy_scale", float(self.cfg.entropy_loss_scale))
+            self.track_data("Curriculum / c", float(c))
+            super().pre_interaction(timestep=timestep, timesteps=timesteps)
 
-    def _on_step(self) -> bool:
-        if self._viewer is None:
-            return True
-        if self.num_timesteps - self._last_render >= self.render_freq:
-            self._last_render = self.num_timesteps
-            self._render_grid()
-        return True
+        def record_transition(self, **kw):
+            super().record_transition(**kw)
+            terminated = kw.get("terminated"); truncated = kw.get("truncated")
+            infos = kw.get("infos")
+            done = (terminated | truncated)
+            if self.training and torch.any(done) and isinstance(infos, dict) and "dist" in infos:
+                d = infos["dist"][done.view(-1)]
+                if d.numel():
+                    self.track_data("Episode / terminal_dist", d.mean().item())
+                    self.track_data("Episode / success_rate",
+                                    (d < SUCCESS_R).float().mean().item())
 
-    def _grid_offset(self, i: int) -> np.ndarray:
-        row, col = divmod(i, self._grid_cols)
-        return np.array([col * self.GRID_SPACING, row * self.GRID_SPACING, 0.0], dtype=np.float32)
-
-    def _dist_color(self, dist: float) -> wp.vec3:
-        t = float(np.clip(dist / 2.0, 0.0, 1.0))
-        return wp.vec3(t, 1.0 - t * 0.8, 0.0)
-
-    def _render_grid(self) -> None:
-        envs = self._train_env.envs
-        drone_tfs, target_tfs, drone_colors, target_colors = [], [], [], []
-
-        for i, env in enumerate(envs):
-            offset = self._grid_offset(i)
-            q_np   = env._state.body_q.numpy()[0]
-            pos    = q_np[:3].astype(np.float32)
-            quat   = q_np[3:].astype(np.float32)
-            drone_tfs.append(wp.transform(
-                wp.vec3(*(pos + offset).tolist()),
-                wp.quat(float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])),
-            ))
-            drone_colors.append(self._dist_color(env.last_dist))
-            target_tfs.append(wp.transform(
-                wp.vec3(*(env._target + offset).tolist()), wp.quat_identity(),
-            ))
-            target_colors.append(wp.vec3(1.0, 0.2, 0.0))
-
-        self._render_t += SIM_DT
-        try:
-            self._viewer.begin_frame(self._render_t)
-            if self._has_drone_mesh:
-                self._viewer.log_instances(
-                    "/train/drones", _CRAZYFLIE_MESH_NAME,
-                    wp.array(drone_tfs,    dtype=wp.transform),
-                    scales=None,
-                    colors=wp.array(drone_colors, dtype=wp.vec3),
-                    materials=None,
-                )
-            else:
-                self._viewer.log_shapes(
-                    "/train/drones", newton.GeoType.BOX,
-                    (_VIZ_SIZE, _VIZ_SIZE, _VIZ_SIZE * 0.25),
-                    wp.array(drone_tfs,    dtype=wp.transform),
-                    wp.array(drone_colors, dtype=wp.vec3),
-                )
-            self._viewer.log_shapes(
-                "/train/targets", newton.GeoType.SPHERE, (0.07,),
-                wp.array(target_tfs,    dtype=wp.transform),
-                wp.array(target_colors, dtype=wp.vec3),
-            )
-            self._viewer.end_frame()
-        except Exception:
-            pass
-
-        if self.verbose >= 1:
-            dists = [e.last_dist for e in envs]
-            currs = [e.curriculum for e in envs]
-            print(f"[render @ {self.num_timesteps:>8,}]  "
-                  f"mean_dist={np.mean(dists):.3f}  min_dist={np.min(dists):.3f}  "
-                  f"curriculum={currs[0]:.2f}")
+    return _Agent
 
 
-# ── Metrics callback ──────────────────────────────────────────────────────
+# ── Config mapping (CLAUDE.md §6) ─────────────────────────────────────────
 
-class MetricsCallback(BaseCallback):
-    """Logs per-episode metrics and reward components to TensorBoard."""
-
-<<<<<<< HEAD
-    _RC_KEYS = ("pos_c", "orient_c", "vel_c", "ang_c", "act_c", "survival", "approach", "hover_rpm_penalty", "hover_action_penalty", "hover_bonus")
-=======
-    _RC_KEYS = ("pos_c", "orient_c", "vel_c", "ang_c", "act_c", "survival")
->>>>>>> cd7cbb2 (after kics)
-
-    def __init__(
-        self,
-        log_freq:       int   = 1_000,
-        window:         int   = 100,
-        target_success: float = 1.0,   # stop early when rolling mean exceeds this; 1.0 = never
-        verbose:        int   = 0,
-    ):
-        super().__init__(verbose)
-        self.log_freq       = log_freq
-        self._target        = target_success
-        self._last_log      = 0
-        self._dists         = deque(maxlen=window)
-        self._uprights      = deque(maxlen=window)
-        self._ep_lens       = deque(maxlen=window)
-        self._ep_rewards    = deque(maxlen=window)
-        self._successes     = deque(maxlen=window)
-        self._mean_rpms     = deque(maxlen=window)
-        self._rc: dict[str, deque] = {k: deque(maxlen=window) for k in self._RC_KEYS}
-
-    def _on_step(self) -> bool:
-        for done, info in zip(self.locals.get("dones", []), self.locals.get("infos", [])):
-            if done and "terminal_dist" in info:
-                d = info["terminal_dist"]
-                self._dists.append(d)
-                self._uprights.append(info["terminal_upright"])
-                self._ep_lens.append(info["terminal_ep_len"])
-                self._ep_rewards.append(info["terminal_reward"])
-                self._successes.append(float(d < 0.15))
-            for k in self._RC_KEYS:
-                v = info.get("reward_components", {}).get(k)
-                if v is not None:
-                    self._rc[k].append(v)
-            rpms = info.get("motor_rpms")
-            if rpms is not None:
-                self._mean_rpms.append(float(np.mean(rpms)))
-
-        if self.num_timesteps - self._last_log >= self.log_freq and self._dists:
-            self._last_log = self.num_timesteps
-            self._flush()
-            if len(self._successes) == self._successes.maxlen:
-                rate = float(np.mean(self._successes))
-                if rate >= self._target:
-                    print(f"\n  [early stop]  success_rate={rate:.3f} >= target={self._target:.2f}"
-                          f"  @  {self.num_timesteps:,} steps — saving and stopping.\n")
-                    return False
-        return True
-
-    def _flush(self) -> None:
-        rec = self.logger.record
-        rec("metrics/terminal_dist",    np.mean(self._dists))
-        rec("metrics/success_rate",     np.mean(self._successes))
-        rec("metrics/terminal_upright", np.mean(self._uprights))
-        rec("metrics/ep_length",        np.mean(self._ep_lens))
-        rec("metrics/ep_reward",        np.mean(self._ep_rewards))
-        if self._mean_rpms:
-            rec("metrics/mean_motor_rpm",   np.mean(self._mean_rpms))
-            # Hover deviation: how far motors are from hover RPM on average
-            rec("metrics/rpm_hover_dev",    abs(np.mean(self._mean_rpms) - CF_HOVER_RPM))
-        for k, buf in self._rc.items():
-            if buf:
-                rec(f"reward_components/{k}", np.mean(buf))
-
-
-# ── Progress-bar callback that shows absolute step position ───────────────
-
-class AbsoluteProgressBar(BaseCallback):
-    """Progress bar whose counter and total are both in absolute steps.
-
-    SB3's built-in progress_bar=True uses tqdm.update(n_envs) each step,
-    so the display always starts from 0 regardless of the resume step.
-    This callback uses pbar.n = model.num_timesteps so the bar shows the
-    real position (e.g. 3,000,000 → 7,000,000) when resuming.
-    """
-
-    def __init__(self, total_timesteps: int) -> None:
-        super().__init__()
-        self._total = total_timesteps
-        self._pbar: _tqdm | None = None
-
-    def _on_training_start(self) -> None:
-        self._pbar = _tqdm(
-            total=self._total,
-            initial=self.model.num_timesteps,
-            unit="step",
-            dynamic_ncols=True,
-        )
-
-    def _on_step(self) -> bool:
-        if self._pbar is not None:
-            self._pbar.n = self.model.num_timesteps
-            self._pbar.refresh()
-        return True
-
-    def _on_training_end(self) -> None:
-        if self._pbar is not None:
-            self._pbar.n = self._total
-            self._pbar.refresh()
-            self._pbar.close()
-
-
-# ── Main ──────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    parser = newton.examples.create_parser()
-    parser.add_argument("--algo",            type=str,   default="td3",
-                        choices=["ppo", "sac", "td3"],
-                        help="RL algorithm (td3 matches the paper).")
-    parser.add_argument("--policy",          type=str,   default="mlp",
-                        choices=["mlp", "gru"],
-                        help="Policy architecture: mlp (standard feedforward) or gru "
-                             "(recurrent LSTM via sb3_contrib.RecurrentPPO). "
-                             "GRU is only supported for PPO; SAC/TD3 always use MLP.")
-    parser.add_argument("--seed",            type=int,   default=0,
-                        help="Global random seed. Run multiple seeds to measure variance.")
-<<<<<<< Updated upstream
-    parser.add_argument("--num_envs",        type=int,   default=16)
-=======
-<<<<<<< Updated upstream
-    parser.add_argument("--num_envs",        type=int,   default=128)
->>>>>>> Stashed changes
-    parser.add_argument("--total_timesteps",  type=int,   default=3_000_000,
-=======
-    parser.add_argument("--num_envs",        type=int,   default=256)
-    parser.add_argument("--total_timesteps",  type=int,   default=20_000_000,
->>>>>>> Stashed changes
-                        help="Total env steps (paper uses 3M for position control).")
-    parser.add_argument("--curriculum_steps", type=int,   default=5_000_000,
-                        help="Steps over which curriculum ramps 0→1 (default 1.5M). "
-                             "Kept fixed so extending --total_timesteps doesn't slow the ramp.")
-    parser.add_argument("--target_success",   type=float, default=1.0,
-                        help="Early-stop when rolling success rate exceeds this (e.g. 0.8). "
-                             "Default 1.0 = never stop early.")
-    parser.add_argument("--lr_final",         type=float, default=None,
-                        help="If set, linearly decay LR from --learning_rate to this value. "
-                             "Useful for fine-tuning in long runs (e.g. 1e-5 for 10M steps).")
-    parser.add_argument("--checkpoint_freq",  type=int,   default=1_000_000)
-    parser.add_argument("--render_freq",      type=int,   default=5_000)
-    parser.add_argument("--checkpoint_dir",   type=str,   default="checkpoints")
-    parser.add_argument("--learning_rate",    type=float, default=3e-4)
-    parser.add_argument("--gamma",            type=float, default=0.99)
-    parser.add_argument("--resume",            type=str,   default=None,
-                        help="Path to a checkpoint .zip to resume training from. "
-                             "Training continues to --total_timesteps from the saved step count.")
-    parser.add_argument("--obs_noise",        action="store_true",
-                        help="Add sensor noise to observations (paper component).")
-    parser.add_argument("--no_curriculum",    action="store_true",
-                        help="Disable reward curriculum (ablation: degrades reliability).")
-
-    viewer, args = newton.examples.init(parser)
-
-    algo = args.algo.lower()
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-
-    # ── Seeding ───────────────────────────────────────────────────────────
-    # Seed every RNG so runs with the same --seed are reproducible and runs
-    # with different --seed give statistically independent samples.
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    try:
-        import torch
-        torch.manual_seed(args.seed)
-        torch.cuda.manual_seed_all(args.seed)
-    except ImportError:
-        pass
-
-    # ── Training environments ─────────────────────────────────────────────
-    # Each parallel env gets its own offset seed so their episode sequences
-    # are independent but still deterministic given --seed.
-    def _make_env(rank: int):
-        def _init():
-            env = DroneEnv(
-                render_mode=None, viewer=None,
-<<<<<<< HEAD
-                random_targets=False,
-                multi_target=args.multi_target,
-=======
-                random_targets=True,
->>>>>>> cd7cbb2 (after kics)
-                obs_noise=args.obs_noise,
-                curriculum=0.0,
-            )
-            env.reset(seed=args.seed + rank)
-            return env
-        return _init
-
-    train_env = DummyVecEnv([_make_env(i) for i in range(args.num_envs)])
-
-    # ── Model ─────────────────────────────────────────────────────────────
-    # Run name encodes algo + seed so every TensorBoard curve is uniquely
-    # identified without ambiguity when comparing across algorithms/seeds.
-    run_name = f"{algo}_{args.policy}_s{args.seed}"
-    tb_log   = "./drone_logs/"
-
-    # LR schedule: constant if --lr_final not set; linear decay otherwise.
-    # SB3 passes progress_remaining ∈ [1.0→0.0] to the callable.
-    if args.lr_final is not None:
-        lr_init, lr_end = args.learning_rate, args.lr_final
-        learning_rate = lambda p: lr_end + (lr_init - lr_end) * p
-    else:
-        learning_rate = args.learning_rate
-
-    # ── Resolve checkpoint path ───────────────────────────────────────────
-    resume_path = None
-    resume_steps = 0  # step count encoded in checkpoint filename (fallback)
-    if args.resume is not None:
-        resume_path = args.resume if args.resume.endswith(".zip") else args.resume + ".zip"
-        if not os.path.exists(resume_path):
-            raise FileNotFoundError(f"Checkpoint not found: '{resume_path}'")
-        import re
-        m = re.search(r'_(\d+)_steps', os.path.basename(resume_path))
-        if m:
-            resume_steps = int(m.group(1))
-
-    # ── Build or load model ───────────────────────────────────────────────
-    if algo == "ppo":
-        if args.policy == "gru":
-            from sb3_contrib import RecurrentPPO as PPO
-            ppo_policy = "MlpLstmPolicy"
-        else:
-            from stable_baselines3 import PPO
-            ppo_policy = "MlpPolicy"
-        if resume_path:
-            model = PPO.load(resume_path, env=train_env)
-<<<<<<< Updated upstream
-            model.learning_rate    = learning_rate
-            model.tensorboard_log  = tb_log
-<<<<<<< Updated upstream
-=======
-            if model.num_timesteps < resume_steps:
-                model.num_timesteps = resume_steps
-=======
-            model.learning_rate   = learning_rate
-            model.tensorboard_log = tb_log
->>>>>>> Stashed changes
->>>>>>> Stashed changes
-        else:
-            model = PPO(
-                ppo_policy, train_env,
-                verbose=1,
-                seed=args.seed,
-                learning_rate=learning_rate,
-                n_steps=2048,
-<<<<<<< Updated upstream
-<<<<<<< HEAD
-                batch_size=64,
-=======
-<<<<<<< Updated upstream
-                batch_size=512,
-=======
-                batch_size=1024,
->>>>>>> Stashed changes
-=======
-                batch_size=512,
-=======
-                batch_size=256,
->>>>>>> cd7cbb2 (after kics)
->>>>>>> Stashed changes
-                n_epochs=10,
-                gamma=args.gamma,
-                gae_lambda=0.95,
-                clip_range=0.3,
-                ent_coef=0.02,
-                vf_coef=0.3,
-                max_grad_norm=0.5,
-                policy_kwargs=dict(
-                    net_arch=[256, 256],
-                    activation_fn=th.nn.Tanh,
-                ),
-                tensorboard_log=tb_log,
-                device="cuda",
-            )
-    elif algo == "sac":
-        if args.policy == "gru":
-            print("  [warn] --policy gru is not supported for SAC; using mlp.")
-        from stable_baselines3 import SAC
-        if resume_path:
-            model = SAC.load(resume_path, env=train_env)
-<<<<<<< Updated upstream
-            model.learning_rate    = learning_rate
-            model.tensorboard_log  = tb_log
-<<<<<<< Updated upstream
-=======
-            if model.num_timesteps < resume_steps:
-                model.num_timesteps = resume_steps
-=======
-            model.learning_rate   = learning_rate
-            model.tensorboard_log = tb_log
->>>>>>> Stashed changes
->>>>>>> Stashed changes
-        else:
-            model = SAC(
-                "MlpPolicy", train_env,
-                verbose=1,
-                learning_rate=learning_rate,
-                buffer_size=500_000,
-                batch_size=256,
-                learning_starts=0,
-                gamma=args.gamma,
-                tau=0.005,
-                ent_coef=0.005,
-                train_freq=1,
-                gradient_steps=1,
-                policy_kwargs=dict(
-                    net_arch=[256, 256],
-                    activation_fn=th.nn.Tanh,
-                ),
-                tensorboard_log=tb_log,
-                device="cuda",
-            )
-    else:  # td3
-        if args.policy == "gru":
-            print("  [warn] --policy gru is not supported for TD3; using mlp.")
-        from stable_baselines3 import TD3
-        action_noise = NormalActionNoise(
-            mean=np.zeros(train_env.action_space.shape),
-            sigma=0.10 * np.ones(train_env.action_space.shape),
-        )
-        if resume_path:
-            model = TD3.load(resume_path, env=train_env)
-<<<<<<< Updated upstream
-            model.learning_rate    = learning_rate
-            model.tensorboard_log  = tb_log
-            model.action_noise     = action_noise
-<<<<<<< Updated upstream
-=======
-            if model.num_timesteps < resume_steps:
-                model.num_timesteps = resume_steps
-=======
-            model.learning_rate   = learning_rate
-            model.tensorboard_log = tb_log
-            model.action_noise    = action_noise
->>>>>>> Stashed changes
->>>>>>> Stashed changes
-        else:
-            model = TD3(
-                "MlpPolicy", train_env,
-                verbose=1,
-                learning_rate=learning_rate,
-                buffer_size=500_000,
-                batch_size=256,
-                learning_starts=0,
-                gamma=args.gamma,
-                tau=0.005,
-                train_freq=1,
-                gradient_steps=1,
-                action_noise=action_noise,
-                policy_delay=2,
-                target_policy_noise=0.2,
-                target_noise_clip=0.5,
-                policy_kwargs=dict(
-                    net_arch=[256, 256],
-                    activation_fn=th.nn.Tanh,
-                ),
-                tensorboard_log=tb_log,
-                device="cuda",
-            )
-
-    # ── Callbacks ─────────────────────────────────────────────────────────
-    callbacks = [
-        CheckpointCallback(
-            save_freq=max(args.checkpoint_freq // args.num_envs, 1),
-            save_path=args.checkpoint_dir,
-            name_prefix=run_name,
-            verbose=1,
-        ),
-        RenderCallback(
-            viewer=viewer,
-            train_vec_env=train_env,
-            render_freq=args.render_freq,
-            verbose=1,
-        ),
-        MetricsCallback(log_freq=1_000, window=100, target_success=args.target_success),
-    ]
-    if not args.no_curriculum:
-        # TD3: decay action-noise σ from 0.10 → 0.02  (small range avoids crash-filling the buffer)
-        # PPO: decay ent_coef 0.005 → 0.0005 so the policy commits to its solution
-        #      after the spawn curriculum has fully widened — mirrors the paper's
-        #      exploration-noise decay schedule for TD3.
-        # SAC: both ignored (SAC auto-tunes entropy, no external action noise).
-        ent_init  = 0.005  if algo == "ppo" else None
-        ent_final = 0.0005 if algo == "ppo" else None
-        callbacks.append(CurriculumCallback(
-            curriculum_steps=args.curriculum_steps,
-            noise_init=0.10,
-            noise_final=0.02,
-            ent_init=ent_init,
-            ent_final=ent_final,
-        ))
-
-    lr_str   = (f"{args.learning_rate:.0e} → {args.lr_final:.0e}"
-                if args.lr_final is not None else f"{args.learning_rate:.0e}")
-    stop_str = (f"{args.target_success:.2f}" if args.target_success < 1.0 else "off")
-    steps_done = model.num_timesteps
-    steps_left = max(args.total_timesteps - steps_done, 0)
-    resume_str = (f"resuming from step {steps_done:,} (+{steps_left:,} remaining)"
-                  if resume_path else "fresh run")
-    print(
-        f"\n  algo={algo.upper()}  policy={args.policy}  seed={args.seed}  "
-        f"target={args.total_timesteps:,}  envs={args.num_envs}  "
-        f"viewer={'off' if viewer is None else 'on'}\n"
-        f"  {resume_str}\n"
-        f"  curriculum_steps={args.curriculum_steps:,}  lr={lr_str}  "
-        f"early_stop={stop_str}  obs_noise={args.obs_noise}\n"
-        f"  CF mass=27g  arm=32.5mm  hover≈{CF_HOVER_RPM:.0f} RPM  action=Level-5.1 RPM\n"
-        f"  run → {run_name}  checkpoints → {args.checkpoint_dir}/{run_name}_*\n"
-        f"  TensorBoard → tensorboard --logdir drone_logs\n"
+def build_ppo_cfg(num_envs: int, rollouts: int, experiment_dir: str, name: str) -> PPO_CFG:
+    cfg = PPO_CFG(
+        rollouts=rollouts,                 # steps/env (rollouts×N ≈ SB3 batch)
+        learning_epochs=10,                # n_epochs
+        mini_batches=max(1, rollouts * num_envs // 16384),
+        discount_factor=0.99,              # gamma
+        gae_lambda=0.95,                   # gae_lambda
+        learning_rate=3e-4,                # lr
+        ratio_clip=0.3,                    # clip_range
+        value_clip=0.3,
+        entropy_loss_scale=0.02,           # ent_coef (decayed to 5e-4 via schedule)
+        value_loss_scale=0.3,              # vf_coef
+        grad_norm_clip=0.5,                # max_grad_norm
+        kl_threshold=0.0,
+        learning_starts=0,
+        observation_preprocessor=RunningStandardScaler,
+        observation_preprocessor_kwargs={"size": OBS_DIM},
+        value_preprocessor=RunningStandardScaler,
+        value_preprocessor_kwargs={"size": 1},
     )
+    cfg.experiment.directory = experiment_dir
+    cfg.experiment.experiment_name = name
+    return cfg
 
-    if steps_left == 0:
-        print("  Nothing to train — checkpoint already at or beyond total_timesteps.")
+
+def build_sac_cfg(experiment_dir: str, name: str) -> SAC_CFG:
+    cfg = SAC_CFG(
+        gradient_steps=1,
+        batch_size=256,                    # SAC batch
+        discount_factor=0.99,              # gamma
+        polyak=0.005,                      # tau
+        learning_rate=3e-4,                # lr (actor+critic+entropy)
+        learn_entropy=True,                # ent_coef auto
+        initial_entropy_value=0.2,
+        random_timesteps=0,
+        learning_starts=1000,
+        grad_norm_clip=0.5,
+        observation_preprocessor=RunningStandardScaler,
+        observation_preprocessor_kwargs={"size": OBS_DIM},
+    )
+    cfg.experiment.directory = experiment_dir
+    cfg.experiment.experiment_name = name
+    return cfg
+
+
+# ── Agent / model factories ───────────────────────────────────────────────
+
+def make_models(algo: str, policy: str, obs_space, act_space, device, num_envs):
+    gru = policy == "gru"
+    if algo == "ppo":
+        if gru:
+            models = {
+                "policy": M.GaussianGRU(obs_space, act_space, device, num_envs, clip_actions=False),
+                "value":  M.DeterministicGRU(obs_space, act_space, device, num_envs),
+            }
+        else:
+            models = {
+                "policy": M.GaussianMLP(obs_space, act_space, device, clip_actions=False),
+                "value":  M.DeterministicMLP(obs_space, act_space, device),
+            }
+    else:  # sac
+        if gru:
+            models = {
+                "policy": M.GaussianGRU(obs_space, act_space, device, num_envs, clip_actions=True),
+                "critic_1": M.QGRU(obs_space, act_space, device, num_envs),
+                "critic_2": M.QGRU(obs_space, act_space, device, num_envs),
+                "target_critic_1": M.QGRU(obs_space, act_space, device, num_envs),
+                "target_critic_2": M.QGRU(obs_space, act_space, device, num_envs),
+            }
+        else:
+            models = {
+                "policy": M.GaussianMLP(obs_space, act_space, device, clip_actions=True),
+                "critic_1": M.QMLP(obs_space, act_space, device),
+                "critic_2": M.QMLP(obs_space, act_space, device),
+                "target_critic_1": M.QMLP(obs_space, act_space, device),
+                "target_critic_2": M.QMLP(obs_space, act_space, device),
+            }
+    return models
+
+
+def make_viewer(render: bool, headless: bool = False):
+    """Create a Newton GL viewer for real-time visualisation, or None."""
+    if not render:
+        return None
+    import newton.viewer
+    return newton.viewer.ViewerGL(headless=headless)
+
+
+def build(args):
+    device = args.device
+    viewer = make_viewer(getattr(args, "render", False))
+    env = BatchedDroneEnv(num_envs=args.num_envs, device=device, curriculum=0.0,
+                          seed=args.seed, capture_graph=not args.no_graph,
+                          viewer=viewer,
+                          render_worlds=getattr(args, "render_worlds", 1),
+                          render_every=getattr(args, "render_every", 4))
+    wrapped = SkrlDroneWrapper(env)
+
+    obs_space, act_space = wrapped.observation_space, wrapped.action_space
+    models = make_models(args.algo, args.policy, obs_space, act_space, device, args.num_envs)
+
+    name = f"{args.algo}_{args.policy}_s{args.seed}"
+    if args.algo == "ppo":
+        cfg = build_ppo_cfg(args.num_envs, args.rollouts, args.logdir, name)
+        memory = RandomMemory(memory_size=args.rollouts, num_envs=args.num_envs, device=device)
+        agent_cls = _make_agent_class(PPO_RNN if args.policy == "gru" else PPO)
     else:
-        if resume_path:
-            callbacks.append(AbsoluteProgressBar(args.total_timesteps))
-        # When reset_num_timesteps=False, SB3 internally adds model.num_timesteps to
-        # total_timesteps (so it treats the argument as a delta, not an absolute target).
-        # Pass steps_left (the delta) so the loop stops at the intended absolute step count.
-        learn_steps = steps_left if resume_path else args.total_timesteps
-        model.learn(
-            total_timesteps=learn_steps,
-            callback=callbacks,
-            tb_log_name=run_name,
-            progress_bar=resume_path is None,
-            reset_num_timesteps=resume_path is None,
-        )
+        cfg = build_sac_cfg(args.logdir, name)
+        # RandomMemory allocates memory_size × num_envs transitions; size per-env so the
+        # total replay capacity ≈ buffer_size regardless of world count.
+        per_env = max(args.buffer_size // args.num_envs, 1)
+        memory = RandomMemory(memory_size=per_env, num_envs=args.num_envs, device=device)
+        agent_cls = _make_agent_class(SAC_RNN if args.policy == "gru" else SAC)
 
-    save_path = f"{algo}_{args.policy}_drone_final_s{args.seed}"
-    model.save(save_path)
-    print(f"\nSaved → {save_path}.zip")
-    train_env.close()
+    agent = agent_cls(models=models, memory=memory, cfg=cfg,
+                      observation_space=obs_space, action_space=act_space, device=device)
+    # Keep entropy small so it doesn't inflate the (deliberately small) action std back
+    # up — fine quadrotor control needs low-variance exploration.
+    agent.configure_schedule(wrapped, args.curriculum_steps, 0.003, 1e-4,
+                             args.entropy_decay_steps)
+    return wrapped, agent
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--algo", choices=["ppo", "sac"], default="ppo")
+    p.add_argument("--policy", choices=["mlp", "gru"], default="mlp")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--num_envs", type=int, default=4096)
+    p.add_argument("--total_timesteps", type=int, default=50_000_000)
+    p.add_argument("--rollouts", type=int, default=24, help="PPO steps per env per update")
+    p.add_argument("--buffer_size", type=int, default=500_000, help="SAC replay (per env)")
+    p.add_argument("--curriculum_steps", type=int, default=5_000_000)
+    p.add_argument("--entropy_decay_steps", type=int, default=20_000_000)
+    p.add_argument("--logdir", default="runs")
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--no_graph", action="store_true", help="disable CUDA-graph capture")
+    p.add_argument("--render", action="store_true",
+                   help="open a real-time OpenGL window to watch training")
+    p.add_argument("--render_worlds", type=int, default=4,
+                   help="number of worlds to display in a grid when --render")
+    p.add_argument("--render_every", type=int, default=4,
+                   help="render one frame every N control steps when --render")
+    args = p.parse_args()
+
+    skrl.config.torch.device = args.device
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
+
+    wrapped, agent = build(args)
+
+    # total_timesteps is environment frames; SKRL counts agent steps (×num_envs).
+    timesteps = max(args.total_timesteps // args.num_envs, 1)
+    trainer = SequentialTrainer(env=wrapped, agents=agent,
+                                cfg={"timesteps": timesteps, "headless": True})
+    print(f"[train] algo={args.algo} policy={args.policy} num_envs={args.num_envs} "
+          f"agent-steps={timesteps} (~{timesteps*args.num_envs:,} frames)")
+    trainer.train()
 
 
 if __name__ == "__main__":
