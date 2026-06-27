@@ -24,7 +24,7 @@ import numpy as np
 import torch
 
 from drone_gym_env import CF_HOVER_RPM, CF_MAX_RPM, FPS
-from drone_env_batched import RAD_TO_RPM, SUCCESS_R, SIM_DT
+from drone_env_batched import RAD_TO_RPM, SUCCESS_R, SIM_DT, GROUND_Z, BODIES_PER_WORLD
 import train_drone as T
 
 DEFAULT_STEPS_PER_WP = 200
@@ -59,10 +59,12 @@ class Policy:
         inputs = {"observations": proc}
         if self.is_rnn:
             inputs["rnn"] = self.rnn
-        _, outputs = self.agent.policy.act(inputs, role="policy")
+        action, outputs = self.agent.policy.act(inputs, role="policy")
         if self.is_rnn:
             self.rnn = outputs.get("rnn", self.rnn)
-        return outputs["mean_actions"]
+        # Gaussian policies (PPO/SAC) expose the deterministic mean; the TD3
+        # deterministic actor returns the greedy action directly.
+        return outputs.get("mean_actions", action)
 
 
 def run_evaluation(policy, env, num_episodes, waypoints_per_ep, steps_per_wp, seed,
@@ -99,7 +101,11 @@ def run_evaluation(policy, env, num_episodes, waypoints_per_ep, steps_per_wp, se
                 ep_rpms.append(float(np.abs(env.motor_omega.numpy()).mean() * RAD_TO_RPM))
                 if slot_dist < SUCCESS_R:
                     reached = True; wpts_reached += 1; break
-                if bool(term[0]):
+                # The training termination box (|p_err| > 0.6 m) is NOT a crash here:
+                # waypoints are 0.5-1.5 m away, so the drone is legitimately outside the
+                # box while flying toward one. Only a genuine ground impact counts.
+                z0 = float(env.state_0.body_q.numpy()[0][2])   # airframe z, world 0
+                if z0 < GROUND_Z:
                     crashed = True; break
 
             wpt_results.append((slot_dist, reached))
@@ -158,7 +164,7 @@ def print_summary(stats, algo, policy, steps_per_wp):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True, help="Path to SKRL checkpoint (.pt)")
-    p.add_argument("--algo", choices=["ppo", "sac"], default="ppo")
+    p.add_argument("--algo", choices=["ppo", "sac", "td3"], default="ppo")
     p.add_argument("--policy", choices=["mlp", "gru"], default="mlp")
     p.add_argument("--num_episodes", type=int, default=10)
     p.add_argument("--waypoints_per_ep", type=int, default=DEFAULT_WAYPOINTS)

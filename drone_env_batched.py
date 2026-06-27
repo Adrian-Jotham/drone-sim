@@ -49,44 +49,27 @@ from drone_gym_env import (
     CF_MAX_RPM, CF_MIN_RPM, CF_HOVER_RPM, CF_RPM_RANGE, MOTOR_TAU,
 )
 
-# ── Reward (paper "Learning to Fly in Seconds", Eschmann 2024, §IV-D) ──────
+# ── Reward (RAPTOR recipe, arXiv 2509.11481 — SAC successor to "Learning to Fly") ──
 #
-#   r = −C_rp‖p‖²  − C_rq(1−q_w²)  − C_rv‖v‖²  − C_rω‖ω‖²  − C_ra‖a−a_rab‖²  + C_rs
+#   r = −‖p‖₂  − 0.2·arccos(R_zz)  − ‖a_t − a_{t-1}‖₂  + 1.5  − 100·𝟙[terminal]
 #
-# The paper uses "a negative squared cost with an additive constant incentivizing
-# survival to mitigate the 'learning to terminate' problem". For that mitigation to
-# actually hold, the per-step reward must stay roughly positive across the spawn
-# envelope — otherwise crashing early (ending the negative stream) is optimal and the
-# policy learns to dive into the ground (the exact failure mode this fixes). Two needs:
+# RAPTOR replaces the paper's SQUARED costs with L2 NORMS: a squared position cost goes
+# nearly flat far from the target, so its gradient vanishes exactly where guidance is most
+# needed; the linear ‖p‖ has constant gradient magnitude everywhere. RAPTOR further finds
+# that this reward change "stabilizes training without the need for a curriculum", so the
+# curriculum ramp is removed (spawn distribution held fixed; see train_drone.py).
 #
-#   1. The position cost is **clipped** (rl-tools `position_clip`) so a far spawn can't
-#      produce an unbounded penalty that dwarfs the survival bonus.
-#   2. The survival constant C_rs dominates the clipped cost budget.
-#
-# The exact constants live in the paper's (unavailable) supplementary material; the
-# values below implement the paper's *formula and design principle* with rl-tools-scale
-# magnitudes that train reliably (survival-dominant, all six terms active, ω now penalised
-# so the drone cannot spin freely). Weights ramp init→target over the curriculum.
-P_ERR_CLIP  = 2.0                     # m — clip ‖p_err‖ at the termination radius only:
-P_ERR_CLIP2 = P_ERR_CLIP * P_ERR_CLIP  #     keeps a navigation gradient everywhere INSIDE
-                                       #     the valid box, just bounds the cost at the edge.
-
-# Position weight ramps low→high over the curriculum. Low early so survival dominates and
-# the drone bootstraps flying/approaching; high late for tight precision once it already
-# hovers near the target (so the large weight rarely produces a large cost). C_rp·dist²max
-# at the boundary stays comparable to survival early on, avoiding "learning to terminate".
-_C_RP_INIT, _C_RP_TGT = 1.0, 4.0      # position  ‖p‖² (clipped at the boundary)
-_C_RV_INIT, _C_RV_TGT = 0.05, 0.30    # linear velocity ‖v‖²  — brakes overshoot/fly-away
-_C_RW_INIT, _C_RW_TGT = 0.02, 0.15    # angular velocity ‖ω‖²  (was 0 → caused free spin)
-_C_RA_INIT, _C_RA_TGT = 0.0, 0.20     # action ‖a − a_rab‖²
-_C_RQ  = 1.0                          # orientation (1 − q_w²), fixed
-# Survival no longer *dominates*: with stable (low-variance) control the drone can actually
-# fly to the target to escape the position cost, so a moderate survival bonus avoids the
-# "learning to terminate" crash without removing the pressure to navigate.
-_C_RS  = 2.5
-_C_RAB = 0.0                          # action baseline (hover action = 0 in hover-centred a)
-_C_APPROACH = 0.0                     # approach shaping disabled — destabilised PPO in
-                                      # practice (it exploited the dense signal / dove).
+# Term design (kept survival-positive, per the paper's anti-"learning-to-terminate"
+# argument): near the target the per-step reward is ≈ +1.5; far inside the 0.6 m box it is
+# still positive (≈ +0.3); a terminal step (ground / box-exit) pays a one-time −100, which
+# replaces weak shaping as the deterrent against crashing. Velocity and angular-rate terms
+# are dropped entirely (RAPTOR has none — also removes the unbounded ‖v‖² that previously
+# diverged the off-policy critic, so no cost clips are needed: linear ‖p‖ is box-bounded).
+_C_POS  = 1.0     # position   ‖p‖₂      (linear, not squared)
+_C_ORI  = 0.2     # orientation 0.2·arccos(R_zz)  (tilt angle from upright)
+_C_ACT  = 1.0     # action smoothness ‖a_t − a_{t-1}‖₂
+_C_SURV = 1.5     # survival bonus per step
+_TERM_PEN = 100.0 # one-time penalty on a terminal step
 
 # ── Derived rotor constants (rad/s domain) ────────────────────────────────
 RPM_TO_RAD = 2.0 * np.pi / 60.0
@@ -96,6 +79,7 @@ OMEGA_HOVER = CF_HOVER_RPM * RPM_TO_RAD          # ≈ 1516 rad/s
 OMEGA_RANGE = CF_RPM_RANGE * RPM_TO_RAD
 OMEGA_MAX   = CF_MAX_RPM   * RPM_TO_RAD
 OMEGA_MIN   = CF_MIN_RPM   * RPM_TO_RAD
+INV_OMEGA_MAX = 1.0 / OMEGA_MAX                  # normalize rotor ω into obs (RC1)
 
 KT_SI = CF_KT * RAD_TO_RPM * RAD_TO_RPM          # N    per (rad/s)²
 KD_SI = CF_KD * RAD_TO_RPM * RAD_TO_RPM          # N·m  per (rad/s)²
@@ -126,7 +110,10 @@ SIM_SUBSTEPS = 4
 SUBSTEP_DT   = SIM_DT / SIM_SUBSTEPS
 
 GROUND_Z   = 0.05
-MAX_DIST   = 2.0
+BOX_HALF   = 0.6     # per-axis |p_err| termination box (RC2). The old 2.0 m sphere was so
+                     # loose the +C_rs survival bonus shaped nothing — the drone could drift
+                     # anywhere and still collect it. A tight box makes survival mean "stay
+                     # near the target" (cf. RK4Dynamics environment.h::terminated, ±0.6 m).
 SUCCESS_R  = 0.15
 
 
@@ -183,11 +170,11 @@ def actuation_kernel(
 
 @wp.kernel
 def obs_kernel(
-    body_q:    wp.array(dtype=wp.transform),
-    joint_qd:  wp.array(dtype=wp.float32),
-    target:    wp.array(dtype=wp.vec3),
-    a_prev:    wp.array(dtype=wp.float32),
-    obs:       wp.array(dtype=wp.float32),
+    body_q:        wp.array(dtype=wp.transform),
+    joint_qd:      wp.array(dtype=wp.float32),
+    target:        wp.array(dtype=wp.vec3),
+    inv_omega_max: wp.float32,
+    obs:           wp.array(dtype=wp.float32),
 ):
     w   = wp.tid()
     af  = w * 5
@@ -212,10 +199,15 @@ def obs_kernel(
     obs[base +15] = R[0, 0]*wx + R[1, 0]*wy + R[2, 0]*wz   # Rᵀ·w_world (body frame)
     obs[base +16] = R[0, 1]*wx + R[1, 1]*wy + R[2, 1]*wz
     obs[base +17] = R[0, 2]*wx + R[1, 2]*wy + R[2, 2]*wz
-    obs[base +18] = a_prev[w*4 + 0]
-    obs[base +19] = a_prev[w*4 + 1]
-    obs[base +20] = a_prev[w*4 + 2]
-    obs[base +21] = a_prev[w*4 + 3]
+    # Actual (ground-truth) rotor speeds, normalized to ~[-1,1] (RC1 fix). The 0.15 s
+    # motor lag makes the commanded action a poor proxy for the thrust actually being
+    # produced; feeding the *measured* rotor ω makes the MDP Markovian so the critic
+    # sees the real thrust state. Replaces the previous-action history (cf. RK4Dynamics
+    # environment.h::observe, which observes rotor speeds for exactly this reason).
+    obs[base +18] = joint_qd[d + 6] * inv_omega_max
+    obs[base +19] = joint_qd[d + 7] * inv_omega_max
+    obs[base +20] = joint_qd[d + 8] * inv_omega_max
+    obs[base +21] = joint_qd[d + 9] * inv_omega_max
 
 
 @wp.kernel
@@ -223,19 +215,16 @@ def reward_done_kernel(
     obs:        wp.array(dtype=wp.float32),
     body_q:     wp.array(dtype=wp.transform),
     action:     wp.array(dtype=wp.float32),
+    a_prev:     wp.array(dtype=wp.float32),    # action from the previous step (aₜ₋₁)
     step_count: wp.array(dtype=wp.int32),
-    c:          wp.float32,
-    crp_i: wp.float32, crp_t: wp.float32,
-    crv_i: wp.float32, crv_t: wp.float32,
-    cra_i: wp.float32, cra_t: wp.float32,
-    crw_i: wp.float32, crw_t: wp.float32,
-    crq: wp.float32, crs: wp.float32, crab: wp.float32,
-    p_clip2:    wp.float32,
-    c_app:      wp.float32,
-    prev_dist:  wp.array(dtype=wp.float32),
+    c_pos:      wp.float32,
+    c_ori:      wp.float32,
+    c_act:      wp.float32,
+    c_surv:     wp.float32,
+    term_penalty: wp.float32,
     max_steps:  wp.int32,
     ground_z:   wp.float32,
-    max_dist:   wp.float32,
+    box_half:   wp.float32,
     reward:     wp.array(dtype=wp.float32),
     terminated: wp.array(dtype=wp.float32),
     truncated:  wp.array(dtype=wp.float32),
@@ -244,34 +233,16 @@ def reward_done_kernel(
     w = wp.tid()
     b = w * 22
     px = obs[b+0]; py = obs[b+1]; pz = obs[b+2]
-    tr = obs[b+3] + obs[b+7] + obs[b+11]
-    qw2 = wp.clamp((tr + 1.0) * 0.25, 0.0, 1.0)
-    vx = obs[b+12]; vy = obs[b+13]; vz = obs[b+14]
-    wx = obs[b+15]; wy = obs[b+16]; wz = obs[b+17]
+    rzz = obs[b+11]                        # R[2,2] = cos(tilt); upright → 1
 
-    crp = crp_i + c * (crp_t - crp_i)
-    crv = crv_i + c * (crv_t - crv_i)
-    cra = cra_i + c * (cra_t - cra_i)
-    crw = crw_i + c * (crw_t - crw_i)
-
-    p2 = px*px + py*py + pz*pz
-    p2c = wp.min(p2, p_clip2)              # clipped position cost (bounds far-spawn penalty)
-    v2 = vx*vx + vy*vy + vz*vz
-    w2 = wx*wx + wy*wy + wz*wz
-    a0 = action[w*4+0]-crab; a1 = action[w*4+1]-crab
-    a2 = action[w*4+2]-crab; a3 = action[w*4+3]-crab
-    asum = a0*a0 + a1*a1 + a2*a2 + a3*a3
-
-    dist = wp.sqrt(p2)
-    # Potential-based approach shaping (policy-invariant; Ng et al. 1999): reward each
-    # metre of distance reduced toward the target. Gives PPO a dense navigation gradient
-    # at every distance — the squared penalty alone is nearly flat far from the goal, so
-    # a survival-dominant reward leaves the drone content to hover anywhere. Φ(s)=−c_app·d.
-    approach = c_app * (prev_dist[w] - dist)
-    prev_dist[w] = dist
-
-    reward[w] = (-crp*p2c - crq*(1.0 - qw2) - crv*v2 - crw*w2 - cra*asum + crs
-                 + approach)
+    # RAPTOR reward terms (L2 norms, not squared).
+    dist = wp.sqrt(px*px + py*py + pz*pz)              # ‖p‖₂
+    tilt = wp.acos(wp.clamp(rzz, -1.0, 1.0))           # arccos(R_zz): tilt from upright
+    da0 = action[w*4+0] - a_prev[w*4+0]
+    da1 = action[w*4+1] - a_prev[w*4+1]
+    da2 = action[w*4+2] - a_prev[w*4+2]
+    da3 = action[w*4+3] - a_prev[w*4+3]
+    dact = wp.sqrt(da0*da0 + da1*da1 + da2*da2 + da3*da3)   # ‖aₜ − aₜ₋₁‖₂
 
     dist_out[w] = dist
 
@@ -279,13 +250,16 @@ def reward_done_kernel(
     sc = step_count[w] + 1
     step_count[w] = sc
     term = 0.0
-    if z < ground_z or dist > max_dist:
+    if z < ground_z or wp.abs(px) > box_half or wp.abs(py) > box_half or wp.abs(pz) > box_half:
         term = 1.0
     terminated[w] = term
     trunc = 0.0
     if sc >= max_steps:
         trunc = 1.0
     truncated[w] = trunc
+
+    reward[w] = (-c_pos*dist - c_ori*tilt - c_act*dact + c_surv
+                 - term_penalty*term)
 
 
 @wp.func
@@ -307,7 +281,6 @@ def reset_kernel(
     a_prev:     wp.array(dtype=wp.float32),    # [N*4] out
     step_count: wp.array(dtype=wp.int32),      # [N] out
     target:     wp.array(dtype=wp.vec3),       # [N] out
-    prev_dist:  wp.array(dtype=wp.float32),    # [N] out (approach-shaping baseline)
 ):
     w = wp.tid()
     if reset_mask[w] == 0.0:
@@ -325,7 +298,9 @@ def reset_kernel(
     target[w] = wp.vec3(tx, ty, tz)
 
     # ── Curriculum spawn extremes ────────────────────────────────────────
-    pos_range = 0.15 + (1.5 - 0.15) * c
+    # Capped well inside the ±0.6 box (RC2): spawning up to the old 1.5 m would put the
+    # drone outside the termination box on reset and end the episode immediately.
+    pos_range = 0.1 + (0.4 - 0.1) * c
     max_tilt  = (0.2617994 + (1.5707963 - 0.2617994) * c)        # 15°→90° in rad
     vel_range = 1.0 * c      # zero linear velocity at c=0 → true hover start
     ang_range = 1.0 * c      # zero body rate at c=0
@@ -390,11 +365,6 @@ def reset_kernel(
         a_prev[w*4 + i] = 0.0
 
     step_count[w] = 0
-    # Approach-shaping baseline = spawn distance to target (no spurious shaping on step 0).
-    ex = joint_q[coord + 0] - tx
-    ey = joint_q[coord + 1] - ty
-    ez = joint_q[coord + 2] - tz
-    prev_dist[w] = wp.sqrt(ex*ex + ey*ey + ez*ez)
 
 
 @wp.kernel
@@ -522,7 +492,6 @@ class BatchedDroneEnv:
         self.step_count  = wp.zeros(N, dtype=wp.int32, device=d)
         self.target      = wp.zeros(N, dtype=wp.vec3, device=d)
         self.reset_mask  = wp.zeros(N, dtype=wp.float32, device=d)
-        self.prev_dist   = wp.zeros(N, dtype=wp.float32, device=d)
 
         # torch views (zero-copy) for the RL interface
         self.obs_t    = wp.to_torch(self.obs_wp).view(N, OBS_DIM)
@@ -556,7 +525,8 @@ class BatchedDroneEnv:
     # ── Obs assembly (T4) ────────────────────────────────────────────────
     def _compute_obs(self) -> None:
         wp.launch(obs_kernel, dim=self.num_envs,
-                  inputs=[self.state_0.body_q, self.state_0.joint_qd, self.target, self.a_prev],
+                  inputs=[self.state_0.body_q, self.state_0.joint_qd, self.target,
+                          INV_OMEGA_MAX],
                   outputs=[self.obs_wp], device=self.device)
 
     # ── Masked curriculum reset (T5) ─────────────────────────────────────
@@ -566,8 +536,7 @@ class BatchedDroneEnv:
                   inputs=[mask_wp, self._rng_ctr, self.curriculum,
                           OMEGA_HOVER, OMEGA_MAX, self.turn_dir],
                   outputs=[self.state_0.joint_q, self.state_0.joint_qd,
-                           self.motor_omega, self.a_prev, self.step_count, self.target,
-                           self.prev_dist],
+                           self.motor_omega, self.a_prev, self.step_count, self.target],
                   device=self.device)
         self._fk()
 
@@ -681,12 +650,10 @@ class BatchedDroneEnv:
         # Obs / reward / termination on the post-step state (T4).
         self._compute_obs()
         wp.launch(reward_done_kernel, dim=self.num_envs,
-                  inputs=[self.obs_wp, self.state_0.body_q, self.action_wp, self.step_count,
-                          self.curriculum,
-                          _C_RP_INIT, _C_RP_TGT, _C_RV_INIT, _C_RV_TGT, _C_RA_INIT, _C_RA_TGT,
-                          _C_RW_INIT, _C_RW_TGT, _C_RQ, _C_RS, _C_RAB,
-                          P_ERR_CLIP2, _C_APPROACH, self.prev_dist,
-                          self.max_episode_steps, GROUND_Z, MAX_DIST],
+                  inputs=[self.obs_wp, self.state_0.body_q, self.action_wp, self.a_prev,
+                          self.step_count,
+                          _C_POS, _C_ORI, _C_ACT, _C_SURV, _TERM_PEN,
+                          self.max_episode_steps, GROUND_Z, BOX_HALF],
                   outputs=[self.reward_wp, self.term_wp, self.trunc_wp, self.dist_wp],
                   device=self.device)
 

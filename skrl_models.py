@@ -10,7 +10,12 @@ per-episode resets), following SKRL's reference GRU example.
 
   * PPO  → GaussianMLP (policy) + DeterministicMLP (value)
   * SAC  → GaussianMLP (policy) + QMLP ×2 (+ targets)
+  * TD3  → DeterministicActorMLP (policy) + QMLP ×2 (+ targets)
   * GRU  → GaussianGRU / DeterministicGRU / QGRU
+
+Net size is the small ``[64, 64]`` of the converging RK4Dynamics TD3 reference
+(rl-tools), not the previous ``[256, 256]`` — a tiny net is plenty for the 22-D
+hover/recovery task and trains faster.
 """
 
 from __future__ import annotations
@@ -20,8 +25,8 @@ import torch.nn as nn
 
 from skrl.models.torch import Model, GaussianMixin, DeterministicMixin
 
-HIDDEN = [256, 256]
-GRU_HIDDEN = 256
+HIDDEN = [64, 64]
+GRU_HIDDEN = 64
 GRU_LAYERS = 1
 SEQUENCE_LENGTH = 16
 
@@ -31,12 +36,14 @@ SEQUENCE_LENGTH = 16
 INIT_LOG_STD = -1.6          # std ≈ 0.20
 
 
-def _mlp(in_dim: int, out_dim: int, hidden=HIDDEN) -> nn.Sequential:
+def _mlp(in_dim: int, out_dim: int, hidden=HIDDEN, final=None) -> nn.Sequential:
     layers, d = [], in_dim
     for h in hidden:
         layers += [nn.Linear(d, h), nn.Tanh()]
         d = h
     layers += [nn.Linear(d, out_dim)]
+    if final is not None:
+        layers += [final()]
     return nn.Sequential(*layers)
 
 
@@ -84,6 +91,24 @@ class QMLP(DeterministicMixin, Model):
     def compute(self, inputs, role=""):
         x = torch.cat([inputs["observations"], inputs["taken_actions"]], dim=-1)
         return self.net(x), {}
+
+
+class DeterministicActorMLP(DeterministicMixin, Model):
+    """Deterministic Tanh-bounded actor μ(s) → action in [-1, 1] (TD3 policy).
+
+    Unlike the Gaussian policy, exploration for TD3 is injected by the agent as
+    additive Gaussian action noise (cfg.exploration_noise); the network output is
+    the greedy action, squashed by a final Tanh into the [-1, 1] action box.
+    """
+
+    def __init__(self, observation_space, action_space, device, clip_actions=True):
+        Model.__init__(self, observation_space=observation_space,
+                       action_space=action_space, device=device)
+        DeterministicMixin.__init__(self, clip_actions=clip_actions)
+        self.net = _mlp(self.num_observations, self.num_actions, final=nn.Tanh)
+
+    def compute(self, inputs, role=""):
+        return self.net(inputs["observations"]), {}
 
 
 # ── GRU models ────────────────────────────────────────────────────────────
