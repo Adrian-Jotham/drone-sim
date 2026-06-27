@@ -78,21 +78,28 @@ class CurriculumCallback(BaseCallback):
     silently slow the curriculum ramp.  Default keeps the old behaviour:
     1_500_000 steps  (= half of the original 3M default).
 
-    Also decays TD3/SAC action noise from noise_init → noise_final over the
-    same window, matching the paper's exploration-noise decay schedule.
+    Also decays:
+      - TD3/SAC action noise from noise_init → noise_final
+      - PPO entropy coefficient from ent_init → ent_final (if provided)
+    over the same window, matching the paper's exploration-noise decay schedule
+    (paper Table 6 — for TD3; the PPO analogue is the entropy term).
     """
 
     def __init__(
         self,
         curriculum_steps: int,
-        noise_init:  float = 0.30,   # σ at training start
-        noise_final: float = 0.05,   # σ after curriculum is fully ramped
+        noise_init:  float = 0.30,   # σ at training start (TD3/SAC)
+        noise_final: float = 0.05,   # σ after curriculum is fully ramped (TD3/SAC)
+        ent_init:    float | None = None,  # PPO ent_coef at start (None = no decay)
+        ent_final:   float | None = None,  # PPO ent_coef after curriculum
         verbose: int = 0,
     ):
         super().__init__(verbose)
         self._curriculum_steps = curriculum_steps
         self._noise_init  = noise_init
         self._noise_final = noise_final
+        self._ent_init    = ent_init
+        self._ent_final   = ent_final
 
     def _on_step(self) -> bool:
         t = min(self.num_timesteps / self._curriculum_steps, 1.0)
@@ -107,6 +114,13 @@ class CurriculumCallback(BaseCallback):
             self.model.action_noise._sigma = np.full(
                 self.model.action_space.shape, sigma, dtype=np.float32
             )
+
+        # Decay PPO entropy coefficient (only if both endpoints are set and the
+        # model exposes ent_coef as a numeric value — SAC uses 'auto' by default).
+        if self._ent_init is not None and self._ent_final is not None:
+            ent_attr = getattr(self.model, "ent_coef", None)
+            if isinstance(ent_attr, (int, float)):
+                self.model.ent_coef = self._ent_init + t * (self._ent_final - self._ent_init)
 
         return True
 
@@ -210,7 +224,11 @@ class RenderCallback(BaseCallback):
 class MetricsCallback(BaseCallback):
     """Logs per-episode metrics and reward components to TensorBoard."""
 
+<<<<<<< HEAD
     _RC_KEYS = ("pos_c", "orient_c", "vel_c", "ang_c", "act_c", "survival", "approach", "hover_rpm_penalty", "hover_action_penalty", "hover_bonus")
+=======
+    _RC_KEYS = ("pos_c", "orient_c", "vel_c", "ang_c", "act_c", "survival")
+>>>>>>> cd7cbb2 (after kics)
 
     def __init__(
         self,
@@ -357,11 +375,6 @@ def main() -> None:
                              "Training continues to --total_timesteps from the saved step count.")
     parser.add_argument("--obs_noise",        action="store_true",
                         help="Add sensor noise to observations (paper component).")
-    parser.add_argument("--multi_target",     action="store_true",
-                        help="When the drone reaches a waypoint, immediately assign a new "
-                             "random one instead of waiting for episode reset. Aligns training "
-                             "with eval_drone.py's sequential-waypoint protocol and forces the "
-                             "policy to learn repeated target-reaching within one episode.")
     parser.add_argument("--no_curriculum",    action="store_true",
                         help="Disable reward curriculum (ablation: degrades reliability).")
 
@@ -389,8 +402,12 @@ def main() -> None:
         def _init():
             env = DroneEnv(
                 render_mode=None, viewer=None,
+<<<<<<< HEAD
                 random_targets=False,
                 multi_target=args.multi_target,
+=======
+                random_targets=True,
+>>>>>>> cd7cbb2 (after kics)
                 obs_noise=args.obs_noise,
                 curriculum=0.0,
             )
@@ -456,6 +473,7 @@ def main() -> None:
                 learning_rate=learning_rate,
                 n_steps=2048,
 <<<<<<< Updated upstream
+<<<<<<< HEAD
                 batch_size=64,
 =======
 <<<<<<< Updated upstream
@@ -463,6 +481,11 @@ def main() -> None:
 =======
                 batch_size=1024,
 >>>>>>> Stashed changes
+=======
+                batch_size=512,
+=======
+                batch_size=256,
+>>>>>>> cd7cbb2 (after kics)
 >>>>>>> Stashed changes
                 n_epochs=10,
                 gamma=args.gamma,
@@ -581,12 +604,19 @@ def main() -> None:
         MetricsCallback(log_freq=1_000, window=100, target_success=args.target_success),
     ]
     if not args.no_curriculum:
-        # TD3: decay from 0.10 → 0.02  (small range avoids crash-filling the buffer)
-        # SAC/PPO: noise_* ignored (SAC has no external noise; PPO ignores it)
+        # TD3: decay action-noise σ from 0.10 → 0.02  (small range avoids crash-filling the buffer)
+        # PPO: decay ent_coef 0.005 → 0.0005 so the policy commits to its solution
+        #      after the spawn curriculum has fully widened — mirrors the paper's
+        #      exploration-noise decay schedule for TD3.
+        # SAC: both ignored (SAC auto-tunes entropy, no external action noise).
+        ent_init  = 0.005  if algo == "ppo" else None
+        ent_final = 0.0005 if algo == "ppo" else None
         callbacks.append(CurriculumCallback(
             curriculum_steps=args.curriculum_steps,
             noise_init=0.10,
             noise_final=0.02,
+            ent_init=ent_init,
+            ent_final=ent_final,
         ))
 
     lr_str   = (f"{args.learning_rate:.0e} → {args.lr_final:.0e}"
@@ -602,7 +632,7 @@ def main() -> None:
         f"viewer={'off' if viewer is None else 'on'}\n"
         f"  {resume_str}\n"
         f"  curriculum_steps={args.curriculum_steps:,}  lr={lr_str}  "
-        f"early_stop={stop_str}  obs_noise={args.obs_noise}  multi_target={args.multi_target}\n"
+        f"early_stop={stop_str}  obs_noise={args.obs_noise}\n"
         f"  CF mass=27g  arm=32.5mm  hover≈{CF_HOVER_RPM:.0f} RPM  action=Level-5.1 RPM\n"
         f"  run → {run_name}  checkpoints → {args.checkpoint_dir}/{run_name}_*\n"
         f"  TensorBoard → tensorboard --logdir drone_logs\n"

@@ -3,14 +3,20 @@
 
 """
 Drone Gymnasium Environment
-Based on "Learning to Fly in Seconds" (Eschmann et al., RAL 2024)
+Based on "Learning to Fly in Seconds" (Eschmann et al., RAL 2024).
+
+Training is a position-controller primitive: each episode samples one random
+target and one random initial state (wide spawn covering the eval waypoint
+range, full SO(3) attitude ≤ 90°, random vel/RPM). Multi-waypoint navigation
+emerges by composing this primitive at eval time.
 
 Observation layout (22-D):
-  [0:3]   p_err  — position error = pos − target  (policy always aims for origin)
-  [3:12]  R_flat — 3×3 rotation matrix, row-major  (avoids quaternion double-coverage)
+  [0:3]   p_err  — position error = pos − target
+  [3:12]  R_flat — 3×3 rotation matrix, row-major
   [12:15] v      — linear velocity, world frame
   [15:18] w      — angular velocity, body frame
-  [18:22] a_prev — last action (action history N_H=1)
+  [18:22] a_prev — last action (N_H=1; paper uses 32 but the extra 124 dims
+                   drown out the 18-D state signal under PPO; smaller helps).
 
 Action (4-D, ∈ [-1, 1]):
   Normalised RPM setpoints, hover-centred (0 → stable hover).
@@ -18,9 +24,11 @@ Action (4-D, ∈ [-1, 1]):
   First-order low-pass motor dynamics applied internally (τ = 0.15 s).
   Physics: F = CF_KT × n², Q = CF_KD × n²  (Level 5.1 — direct RPM control)
 
-Reward (paper Eq. 1):
-  r = −C_rp‖p_err‖² − C_rq(1−qw²) − C_rv‖v‖² − C_rω‖ω‖² − C_ra‖Δa‖² + C_rs
-  Weights ramp from conservative to strict via env.curriculum ∈ [0, 1].
+Reward (paper Eq. 1 + Table 2 weights, action-baseline form):
+  r = −C_rp‖p_err‖² − C_rq(1−qw²) − C_rv‖v‖² − C_rω‖ω‖² − C_ra‖a − C_rab‖² + C_rs
+  Weights linearly ramp init → target via env.curriculum ∈ [0, 1].
+  C_rab = 0 here because action is already hover-centred (paper uses 0.334 for
+  their [-1,1] → [0, MAX_RPM] mapping; equivalent hover point in our parameterisation).
 
 Crazyflie 2.x physical parameters (Förster 2015 system ID + Bitcraze docs):
   Mass:  27 g,  Arm: 32.5 mm
@@ -125,7 +133,7 @@ def _load_crazyflie_mesh(arm_length: float):
 
 FPS               = 100          # Hz — matches paper's simulator frequency
 SIM_DT            = 1.0 / FPS
-MAX_EPISODE_STEPS = 800          # 8 s — matches eval budget (4 wp × 200 steps)
+MAX_EPISODE_STEPS = 500          # 5 s per single-target episode (paper Table 6)
 
 # ── Crazyflie 2.x physical parameters ────────────────────────────────────
 # Sources: Förster 2015 (ETH system ID), Bitcraze documentation, Eschmann 2024
@@ -159,6 +167,8 @@ MOTOR_TAU   = 0.15
 MOTOR_ALPHA = SIM_DT / MOTOR_TAU   # ≈ 0.067 per step
 
 # Observation / action sizes
+# Note: paper uses N_H=32; empirically N_H=1 trains better with our PPO setup
+# (146-D obs with 128 action-history dims swamps the 18-D state signal).
 N_ACTION_HIST = 1
 OBS_DIM       = 3 + 9 + 3 + 3 + N_ACTION_HIST * 4   # 22
 
@@ -181,29 +191,52 @@ def _sample_random_target(rng: np.random.Generator) -> np.ndarray:
     alt    = rng.uniform(0.3, 1.2)
     return np.array([radius * np.cos(angle), radius * np.sin(angle), alt], dtype=np.float32)
 
+
+def _sample_random_orientation_capped(rng: np.random.Generator, max_tilt: float) -> np.ndarray:
+    """Uniform SO(3) restricted to body-z tilted at most `max_tilt` rad from world-z.
+
+    Paper Table 3 (at max_tilt = π/2) plus a curriculum-tunable cap for bootstrap.
+    Direct construction (no rejection): sample body-z on spherical cap × uniform yaw.
+    Returns [qx, qy, qz, qw].
+    """
+    # Body-z direction uniformly on spherical cap around (0,0,1) of half-angle max_tilt.
+    # cos(theta) uniform in [cos(max_tilt), 1] gives area-uniform sampling on the cap.
+    cos_theta = float(rng.uniform(np.cos(max_tilt), 1.0))
+    phi       = float(rng.uniform(0.0, 2.0 * np.pi))
+
+    if cos_theta > 0.9999:
+        q_tilt = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    else:
+        # Axis = world_z × body_z (normalized): rotates world-z to the sampled direction.
+        axis = np.array([-np.sin(phi), np.cos(phi), 0.0])
+        half = np.arccos(cos_theta) * 0.5
+        s, c = np.sin(half), np.cos(half)
+        q_tilt = np.array([axis[0] * s, axis[1] * s, 0.0, c], dtype=np.float64)
+
+    # Uniform yaw around world-z; compose as q = q_tilt * q_yaw.
+    half_y = float(rng.uniform(0.0, 2.0 * np.pi)) * 0.5
+    q_yaw  = np.array([0.0, 0.0, np.sin(half_y), np.cos(half_y)], dtype=np.float64)
+
+    x1, y1, z1, w1 = q_tilt
+    x2, y2, z2, w2 = q_yaw
+    return np.array([
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+    ], dtype=np.float32)
+
 # ── Reward weight curriculum ──────────────────────────────────────────────
-# env.curriculum ∈ [0,1]: 0 = init (easy), 1 = target (hard).
+# Paper Table 2: linear interpolation from C_init to C_target via env.curriculum ∈ [0, 1].
 
-_C_RP_INIT, _C_RP_TGT = 0.05, 1.00   # position error ‖p_err‖²
-_C_RV_INIT, _C_RV_TGT = 0.01, 0.30   # linear velocity ‖v‖²
-_C_RW_INIT, _C_RW_TGT = 0.001, 0.05  # angular velocity ‖ω‖²
-_C_RA_INIT, _C_RA_TGT = 0.005, 0.02  # action-change regularisation ‖Δa‖²
+_C_RP_INIT, _C_RP_TGT = 2.5, 20.0    # position error ‖p_err‖²        (paper: 2.5 → 20)
+_C_RV_INIT, _C_RV_TGT = 0.005, 0.5   # linear velocity ‖v‖²            (paper: 0.005 → 0.5)
+_C_RA_INIT, _C_RA_TGT = 0.005, 0.5   # action magnitude ‖a − C_rab‖²   (paper: 0.005 → 0.5)
 
-_C_RQ = 0.10   # orientation cost  (1 − qw²)  — fixed
-_C_RS = 10   # survival bonus per step       — fixed
-
-# Approach / hover shaping constants
-_APPROACH_COEF      = 1.0   # potential-shaping weight (was 2.0 — reduced to curb overshoot)
-# _APPROACH_COEF      = 0   # potential-shaping weight (reduced from 1.0 to curb overshoot)
-_APPROACH_GATE      = 0.15  # m — suppress approach reward inside this radius to stop oscillation
-# _HOVER_BONUS        = 0.15  # per-step bonus for settling at target (halved from 0.30)
-# _HOVER_BONUS        = 0.0   # per-step bonus for settling at target (disabled to simplify reward)
-# _HOVER_SPEED_GATE   = 0.5   # m/s — must be slow to earn hover bonus; stops rush-to-target
-
-# ── Hover-stabilization reward (new) ────────────────────────────────────────
-_C_HOVER_RPM   = 0.15   # penalty for motor RPM deviation from CF_HOVER_RPM
-_C_HOVER_ACTION = 0.10  # penalty for action deviation from 0 (hover point)
-_C_HOVER_BONUS = 0.20   # per-step bonus when actively hovering (position stable + low velocity + correct RPM)
+_C_RQ  = 2.5   # orientation cost (1 − qw²)               — fixed (paper)
+_C_RS  = 2.0   # survival bonus per step                  — fixed (paper)
+_C_RW  = 0.0   # angular velocity ‖ω‖²                    — fixed at 0 (paper)
+_C_RAB = 0.0   # action baseline: 0 for hover-centred a    (paper 0.334 in their RPM-direct mapping)
 
 
 # ── Propeller physics (Level 5.1 — direct RPM) ───────────────────────────
@@ -277,7 +310,6 @@ class DroneEnv(gymnasium.Env):
         render_mode:    str | None = None,
         viewer         = None,
         random_targets: bool  = True,
-        multi_target:   bool  = False,
         obs_noise:      bool  = False,
         curriculum:     float = 0.0,
     ):
@@ -285,7 +317,6 @@ class DroneEnv(gymnasium.Env):
         self.render_mode     = render_mode
         self._viewer         = viewer
         self._random_targets = random_targets
-        self._multi_target   = multi_target
         self.obs_noise       = obs_noise
         self.curriculum      = float(np.clip(curriculum, 0.0, 1.0))
 
@@ -303,8 +334,7 @@ class DroneEnv(gymnasium.Env):
         self._ep_reward   = 0.0
         self._render_t    = 0.0
         self._target      = TARGETS[0].copy()
-        self._arrived     = False
-        self._prev_action = np.zeros(4, dtype=np.float32)
+        self._action_hist = np.zeros((N_ACTION_HIST, 4), dtype=np.float32)
         self._motor_rpms  = np.full(4, CF_HOVER_RPM, dtype=np.float32)
 
         # Public: readable by training callbacks
@@ -380,7 +410,7 @@ class DroneEnv(gymnasium.Env):
         p_err  = pos - self._target
         R_flat = _quat_to_rotmat(quat)
 
-        obs = np.concatenate([p_err, R_flat, v, w, self._prev_action])
+        obs = np.concatenate([p_err, R_flat, v, w, self._action_hist.flatten()])
 
         if self.obs_noise:
             rng = self.np_random
@@ -397,54 +427,58 @@ class DroneEnv(gymnasium.Env):
         self._step_count  = 0
         self._ep_reward   = 0.0
         self._render_t    = 0.0
-        self._arrived     = False
-        self._prev_action = np.zeros(4, dtype=np.float32)
-        self._motor_rpms  = np.full(4, CF_HOVER_RPM, dtype=np.float32)
+        self._action_hist = np.zeros((N_ACTION_HIST, 4), dtype=np.float32)
 
+        rng = self.np_random
         if self._random_targets:
-            self._target = _sample_random_target(self.np_random)
+            self._target = _sample_random_target(rng)
         else:
             self._target = TARGETS[0].copy()
 
-        # Spawn range grows with curriculum. Cap at 0.7 m so that the
-        # survival bonus (+0.5/step) always exceeds the position penalty
-        # (-C_rp × dist²) at spawn, keeping episode returns positive and
-        # giving PPO a learnable gradient from the first update.
-        pos_range = 0.1 + 0.6 * self.curriculum   # 0.1 m → 0.7 m
-        lin_range = 1.5 * self.curriculum           # 0 → ±1.5 m/s linear velocity
-        ang_range = 0.5 * self.curriculum           # 0 → ±0.5 rad/s angular velocity
+        # ── Curriculum-gated spawn extremes ──────────────────────────────
+        # env.curriculum ∈ [0, 1] interpolates from an easy bootstrap distribution
+        # (c=0: small perturbation around target, mild tilt, near-hover RPM) to
+        # full paper Table 3 + widened-for-navigation spawn (c=1).
+        #
+        # Without this gating, PPO faces the hardest spawn from step 0 while the
+        # reward weights are still at their gentlest — death-spirals immediately
+        # because terminating the episode is cheaper than enduring the position
+        # penalty from a 1.5 m random spawn.
+        c = self.curriculum
+        pos_range = 0.15 + (1.5  - 0.15) * c            # ±0.15 m → ±1.5 m on each axis
+        max_tilt  = (15.0 + (90.0 - 15.0) * c) * (np.pi / 180.0)  # ±15° → ±90°
+        vel_range = 0.10 + (1.0  - 0.10) * c            # ±0.1 m/s   → ±1.0 m/s
+        ang_range = 0.10 + (1.0  - 0.10) * c            # ±0.1 rad/s → ±1.0 rad/s
+        rpm_low   = (1.0 - c) * (CF_HOVER_RPM * 0.95)                                # 0.95·hover  → 0
+        rpm_high  = (1.0 - c) * (CF_HOVER_RPM * 1.05) + c * (CF_MAX_RPM / 2.0)        # 1.05·hover → MAX/2
 
-        xy     = self.np_random.uniform(-pos_range, pos_range, 2).astype(np.float32)
-        dz     = float(self.np_random.uniform(-pos_range, pos_range))   # full range, not ×0.5
-        init_z = max(self._target[2] + dz, 0.15)
-
-        # Random initial roll/pitch up to ±15° at full curriculum (no yaw randomisation).
-        # Forces the policy to learn attitude stabilisation concurrent with navigation,
-        # not sequentially after spawning level.
-        max_ori = 15.0 * self.curriculum * (np.pi / 180.0)
-        if max_ori > 0.0:
-            roll  = float(self.np_random.uniform(-max_ori, max_ori))
-            pitch = float(self.np_random.uniform(-max_ori, max_ori))
-            cr, sr = np.cos(roll * 0.5), np.sin(roll * 0.5)
-            cp, sp = np.cos(pitch * 0.5), np.sin(pitch * 0.5)
-            # Quaternion for roll-then-pitch (ZYX, yaw=0): [qx, qy, qz, qw]
-            init_quat = wp.quat(float(cp * sr), float(sp * cr), float(-sp * sr), float(cp * cr))
-        else:
+        # 10 % guidance branch (paper Table 3) — always on, curriculum-independent.
+        # Spawn at target with identity attitude; vel/RPM still sampled below.
+        # Acts as a permanent supply of "hold-at-target" data so the policy
+        # doesn't forget the stabilisation sub-skill as spawn widens.
+        if rng.uniform() < 0.10:
+            init_x, init_y, init_z = float(self._target[0]), float(self._target[1]), float(self._target[2])
             init_quat = wp.quat_identity()
+        else:
+            dx, dy, dz = rng.uniform(-pos_range, pos_range, 3).astype(np.float32)
+            init_x = float(self._target[0] + dx)
+            init_y = float(self._target[1] + dy)
+            init_z = float(np.clip(self._target[2] + dz, 0.15, 1.5))
+            q = _sample_random_orientation_capped(rng, max_tilt)
+            init_quat = wp.quat(float(q[0]), float(q[1]), float(q[2]), float(q[3]))
 
-        init_pos = wp.transform(
-            wp.vec3(float(self._target[0] + xy[0]),
-                    float(self._target[1] + xy[1]),
-                    init_z),
-            init_quat,
-        )
-        self._state.body_q.assign([init_pos])
+        self._state.body_q.assign([wp.transform(
+            wp.vec3(init_x, init_y, init_z), init_quat,
+        )])
 
-        # Separate linear and angular velocity ranges so each axis is covered
-        # at the right physical scale (translational vs. rotational dynamics differ).
-        lin_v = self.np_random.uniform(-lin_range, lin_range, 3).astype(np.float32)
-        ang_v = self.np_random.uniform(-ang_range, ang_range, 3).astype(np.float32)
+        lin_v = rng.uniform(-vel_range, vel_range, 3).astype(np.float32)
+        ang_v = rng.uniform(-ang_range, ang_range, 3).astype(np.float32)
         self._state.body_qd.assign([np.concatenate([ang_v, lin_v])])
+
+        self._motor_rpms = np.clip(
+            rng.uniform(rpm_low, rpm_high, 4).astype(np.float32),
+            CF_MIN_RPM, CF_MAX_RPM,
+        )
 
         obs = self._get_obs()
         self.last_dist    = float(np.linalg.norm(obs[0:3]))
@@ -477,8 +511,9 @@ class DroneEnv(gymnasium.Env):
         self._solver.step(self._state, self._state1, None, None, SIM_DT)
         self._state, self._state1 = self._state1, self._state
 
-        prev_action       = self._prev_action.copy()
-        self._prev_action = action.astype(np.float32)
+        # Push current action onto the FIFO history buffer (most recent at end).
+        self._action_hist = np.roll(self._action_hist, -1, axis=0)
+        self._action_hist[-1] = action.astype(np.float32)
 
         obs       = self._get_obs()
         p_err     = obs[0:3]
@@ -494,72 +529,33 @@ class DroneEnv(gymnasium.Env):
         qw   = float(quat[3])
         R22  = float(1.0 - 2.0 * (quat[0]**2 + quat[1]**2))  # drone_up · world_z
 
-        # ── Reward (paper Eq. 1) ──────────────────────────────────────────
+        # ── Reward (paper Eq. 1 + Table 2) ────────────────────────────────
         c    = float(self.curriculum)
         C_rp = _C_RP_INIT + c * (_C_RP_TGT - _C_RP_INIT)
         C_rv = _C_RV_INIT + c * (_C_RV_TGT - _C_RV_INIT)
-        C_rw = _C_RW_INIT + c * (_C_RW_TGT - _C_RW_INIT)
         C_ra = _C_RA_INIT + c * (_C_RA_TGT - _C_RA_INIT)
 
-        delta_a  = action - prev_action
+        act_dev  = action - _C_RAB
 
         pos_c    = -C_rp  * float(np.dot(p_err,    p_err))
         orient_c = -_C_RQ * float(1.0 - qw**2)
         vel_c    = -C_rv  * float(np.dot(v,         v))
-        ang_c    = -C_rw  * float(np.dot(w,         w))
-        act_c    = -C_ra  * float(np.dot(delta_a,   delta_a))
+        ang_c    = -_C_RW * float(np.dot(w,         w))
+        act_c    = -C_ra  * float(np.dot(act_dev,   act_dev))
         survival =  _C_RS
 
-        crash = -8.0 if z < 0.05 else 0.0
-
-        arrival = 0.0
-        if dist < 0.15 and not self._arrived:
-            arrival = 60.0
-            self._arrived = True
-            if self._multi_target and self._random_targets:
-                self.set_target(_sample_random_target(self.np_random))
-
-        # Potential-based shaping: only active far from target so the drone
-        # doesn't oscillate trying to generate approach reward near the waypoint.
-        approach = (
-            _APPROACH_COEF * (self.last_dist - dist)
-            if dist > _APPROACH_GATE else 0.0
-        )
-
-        # ── Hover stabilization reward ────────────────────────────────────────
-        # Penalize deviation from hover RPM: this keeps motors at the correct speed to maintain altitude
-        rpm_deviation = np.abs(self._motor_rpms - CF_HOVER_RPM).mean()  # average deviation across 4 motors
-        hover_rpm_penalty = -_C_HOVER_RPM * float(rpm_deviation / CF_HOVER_RPM)  # normalized penalty
-        
-        # Penalize action deviation from 0 (which corresponds to hover RPM)
-        # This encourages the policy to use action ≈ 0 when hovering
-        hover_action_penalty = -_C_HOVER_ACTION * float(np.dot(action, action))
-        
-        # Bonus for actively hovering: when drone is stable at target with low velocity
-        # This rewards steady hovering behavior rather than rapid movement
-        hover_bonus = 0.0
-        if dist < 0.20 and np.linalg.norm(v) < 0.5:  # close to target, moving slowly
-            # Smooth bonus based on how close to hover action (0) the agent is
-            action_magnitude = np.linalg.norm(action)
-            hover_bonus = _C_HOVER_BONUS * max(0.0, 1.0 - action_magnitude * 2.0)
-
-        reward = pos_c + orient_c + vel_c + ang_c + act_c + survival + crash + arrival + approach + hover_rpm_penalty + hover_action_penalty + hover_bonus 
-        # reward = pos_c + orient_c + vel_c + ang_c + act_c + survival + crash + arrival + approach 
+        reward = pos_c + orient_c + vel_c + ang_c + act_c + survival
 
         # ── Termination ───────────────────────────────────────────────────
-        terminated = bool(
-            z    < 0.05  or   # ground impact
-            z    > 6.0   or   # escaped upward
-            R22  < -0.5  or   # severely inverted
-            dist > 4.0        # out of arena
-        )
+        # Paper Table 5 uses 0.6 m position error; we widen to 2.0 m so that
+        # spawns up to 1.5 m from the target don't terminate immediately.
+        # Ground impact kept as a physics-stability guard.
+        terminated = bool(z < 0.05 or dist > 2.0)
 
         self._step_count += 1
         truncated         = self._step_count >= MAX_EPISODE_STEPS
         self._ep_reward  += reward
-        # Recompute last_dist against the current target — handles the case where
-        # multi_target changed self._target mid-step (prevents a one-step approach spike).
-        self.last_dist    = float(np.linalg.norm(pos - self._target))
+        self.last_dist    = dist
         self.last_upright = R22
 
         info: dict = {
@@ -568,16 +564,12 @@ class DroneEnv(gymnasium.Env):
             "z":       z,
             "motor_rpms": self._motor_rpms.tolist(),
             "reward_components": {
-                "pos_c":              pos_c,
-                "orient_c":           orient_c,
-                "vel_c":              vel_c,
-                "ang_c":              ang_c,
-                "act_c":              act_c,
-                "survival":           survival,
-                "approach":           approach,
-                "hover_rpm_penalty":  hover_rpm_penalty,
-                "hover_action_penalty": hover_action_penalty,
-                "hover_bonus":        hover_bonus,
+                "pos_c":    pos_c,
+                "orient_c": orient_c,
+                "vel_c":    vel_c,
+                "ang_c":    ang_c,
+                "act_c":    act_c,
+                "survival": survival,
             },
         }
         if terminated or truncated:
@@ -596,7 +588,6 @@ class DroneEnv(gymnasium.Env):
     def set_target(self, target: np.ndarray) -> None:
         """Switch waypoint mid-episode; call get_obs() to refresh observation."""
         self._target   = np.asarray(target, dtype=np.float32).copy()
-        self._arrived  = False
         body_q         = self._state.body_q.numpy()[0]
         self.last_dist = float(np.linalg.norm(body_q[:3].astype(np.float32) - self._target))
 
