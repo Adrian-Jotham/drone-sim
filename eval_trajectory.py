@@ -20,13 +20,82 @@
 ###########################################################################
 
 import os
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.45")
-
+import time
 import numpy as np
+import torch as th
 
 import newton.examples
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.td3.policies import TD3Policy, Actor as TD3Actor
+from stable_baselines3.sac.policies import SACPolicy, Actor as SACActor
 from drone_gym_env import DroneEnv, CF_HOVER_RPM, CF_MAX_RPM, FPS
+
+
+# ── AAC policy stubs (mirrors train_drone.py) ─────────────────────────────
+# Required to load checkpoints saved with the asymmetric actor-critic setup.
+
+_ACTOR_OBS_DIM = 22
+
+class _ActorSliceExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space) -> None:
+        super().__init__(observation_space, features_dim=_ACTOR_OBS_DIM)
+    def forward(self, obs: th.Tensor) -> th.Tensor:
+        return obs[..., :_ACTOR_OBS_DIM]
+
+class AACTd3Policy(TD3Policy):
+    def make_actor(self, features_extractor=None):
+        actor_kwargs = self._update_features_extractor(
+            self.actor_kwargs, _ActorSliceExtractor(self.observation_space)
+        )
+        return TD3Actor(**actor_kwargs).to(self.device)
+
+class AACSacPolicy(SACPolicy):
+    def make_actor(self, features_extractor=None):
+        actor_kwargs = self._update_features_extractor(
+            self.actor_kwargs, _ActorSliceExtractor(self.observation_space)
+        )
+        return SACActor(**actor_kwargs).to(self.device)
+
+
+# ── Model loader with obs-space mismatch handling ─────────────────────────
+
+def _load_model(algo: str, path: str, env: DroneEnv):
+    """Load a saved model and return (model, obs_dim).
+
+    obs_dim is the number of obs features the model expects. When the
+    environment now returns more features than the model was trained on
+    (e.g. old 22-D checkpoint with new 26-D env), obs_dim < env obs dim
+    and the caller must slice obs[:obs_dim] before calling model.predict().
+    Returns obs_dim=None when the model matches the current env.
+    """
+    from stable_baselines3 import PPO, SAC, TD3
+
+    cls        = {"ppo": PPO, "sac": SAC, "td3": TD3}[algo]
+    aac_policy = {"ppo": None, "sac": AACSacPolicy, "td3": AACTd3Policy}[algo]
+
+    # ── Try normal load first (obs spaces already match) ──────────────────
+    try:
+        model = cls.load(path, env=env)
+        return model, None
+    except Exception:
+        pass
+
+    # ── Obs-space mismatch: load without env, then detect the gap ─────────
+    for custom_objects in [None, {"policy_class": aac_policy}]:
+        try:
+            model = cls.load(path, env=None, custom_objects=custom_objects)
+            break
+        except Exception:
+            continue
+    else:
+        raise RuntimeError(f"Could not load model from '{path}' for algo '{algo}'.")
+
+    model_obs_dim = model.observation_space.shape[0]
+    env_obs_dim   = env.observation_space.shape[0]
+    obs_dim       = model_obs_dim if model_obs_dim != env_obs_dim else None
+    return model, obs_dim
+
+_STEP_DT = 1.0 / FPS   # wall-clock budget per step for real-time playback
 
 DEFAULT_MAX_WAYPOINTS = 20
 DEFAULT_MAX_STEPS     = 8000   # ~80 s per episode
@@ -80,12 +149,14 @@ def _traj_description(traj: str) -> str:
 def run_evaluation(
     model,
     env:           DroneEnv,
-    num_episodes:  int  = 5,
-    max_waypoints: int  = DEFAULT_MAX_WAYPOINTS,
-    max_steps:     int  = DEFAULT_MAX_STEPS,
-    traj:          str  = DEFAULT_TRAJ,
-    deterministic: bool = True,
-    seed:          int  = 42,
+    num_episodes:  int       = 5,
+    max_waypoints: int       = DEFAULT_MAX_WAYPOINTS,
+    max_steps:     int       = DEFAULT_MAX_STEPS,
+    traj:          str       = DEFAULT_TRAJ,
+    deterministic: bool      = True,
+    seed:          int       = 42,
+    realtime:      bool      = True,
+    obs_dim:       int|None  = None,
 ) -> dict:
     rng = np.random.default_rng(seed)
 
@@ -125,8 +196,14 @@ def run_evaluation(
         symbols: list[str] = []
 
         while wpts_reached < max_waypoints and total_steps < max_steps:
-            action, _ = model.predict(obs, deterministic=deterministic)
+            t0 = time.perf_counter()
+            obs_input = obs[:obs_dim] if obs_dim is not None else obs
+            action, _ = model.predict(obs_input, deterministic=deterministic)
             obs, _, terminated, _, info = env.step(action)
+            if realtime:
+                remaining = _STEP_DT - (time.perf_counter() - t0)
+                if remaining > 0:
+                    time.sleep(remaining)
 
             total_steps  += 1
             leg_steps    += 1
@@ -318,6 +395,8 @@ def main() -> None:
                         help=f"Step cap per episode (default {DEFAULT_MAX_STEPS} ≈ {DEFAULT_MAX_STEPS//FPS} s).")
     parser.add_argument("--seed",          type=int, default=42)
     parser.add_argument("--stochastic",    action="store_true")
+    parser.add_argument("--no_realtime",   action="store_true",
+                        help="Run as fast as possible (default: throttle to real-world 100 Hz).")
     parser.add_argument("--clean_start",   action="store_true",
                         help="Spawn upright with zero velocity (curriculum=0). "
                              "Tests pure navigation without spawn-state recovery.")
@@ -335,15 +414,10 @@ def main() -> None:
     eval_env = DroneEnv(render_mode="human", viewer=viewer, random_targets=False)
     eval_env.curriculum = 0.0 if args.clean_start else 1.0
 
-    if algo == "ppo":
-        from stable_baselines3 import PPO
-        model = PPO.load(args.model, env=eval_env)
-    elif algo == "sac":
-        from sbx import SAC
-        model = SAC.load(args.model, env=eval_env)
-    else:
-        from sbx import TD3
-        model = TD3.load(args.model, env=eval_env)
+    model, obs_dim = _load_model(algo, args.model, eval_env)
+    if obs_dim is not None:
+        print(f"[compat] model expects {obs_dim}-D obs, env returns "
+              f"{eval_env.observation_space.shape[0]}-D — slicing obs automatically.\n")
 
     spawn_mode = "clean (curriculum=0.0)" if args.clean_start else "randomised (curriculum=1.0)"
     print(f"Running {args.num_episodes} ep × up to {args.max_waypoints} wps  "
@@ -358,6 +432,8 @@ def main() -> None:
         traj=args.traj,
         deterministic=not args.stochastic,
         seed=args.seed,
+        realtime=not args.no_realtime,
+        obs_dim=obs_dim,
     )
 
     print_summary(stats, algo)

@@ -170,9 +170,14 @@ MOTOR_ALPHA = SIM_DT / MOTOR_TAU   # ≈ 0.067 per step
 # Note: paper uses N_H=32; empirically N_H=1 trains better with our PPO setup
 # (146-D obs with 128 action-history dims swamps the 18-D state signal).
 N_ACTION_HIST = 1
-OBS_DIM       = 3 + 9 + 3 + 3 + N_ACTION_HIST * 4   # 22
+OBS_DIM = 3 + 9 + 3 + 3 + N_ACTION_HIST * 4 + 4 + 3 + 3  # 32 (22 state + 4 ωm + 3 fr + 3 τr)
 
-# Fixed waypoints used when random_targets=False (eval / render)
+# Training target: fixed at centre (paper trains "fly to origin from anywhere").
+# The policy only observes p_err = pos − target, so any fixed point is equivalent
+# to the paper's origin. At deployment: p_err = pos − actual_target (same trick).
+TRAIN_TARGET = np.array([0.0, 0.0, 0.5], dtype=np.float32)
+
+# Fixed waypoints used when random_targets=False in EVAL / render mode
 TARGETS = [
     np.array([ 1.0,  0.0, 0.5], dtype=np.float32),
     np.array([ 0.0,  1.0, 0.5], dtype=np.float32),
@@ -311,6 +316,7 @@ class DroneEnv(gymnasium.Env):
         viewer         = None,
         random_targets: bool  = True,
         obs_noise:      bool  = False,
+        disturbances:   bool  = False,
         curriculum:     float = 0.0,
     ):
         super().__init__()
@@ -318,6 +324,7 @@ class DroneEnv(gymnasium.Env):
         self._viewer         = viewer
         self._random_targets = random_targets
         self.obs_noise       = obs_noise
+        self.disturbances    = disturbances
         self.curriculum      = float(np.clip(curriculum, 0.0, 1.0))
 
         self.observation_space = spaces.Box(
@@ -336,6 +343,9 @@ class DroneEnv(gymnasium.Env):
         self._target      = TARGETS[0].copy()
         self._action_hist = np.zeros((N_ACTION_HIST, 4), dtype=np.float32)
         self._motor_rpms  = np.full(4, CF_HOVER_RPM, dtype=np.float32)
+        # Episode-level disturbances (sampled in reset, constant per episode)
+        self._force_dist  = np.zeros(3, dtype=np.float32)
+        self._torque_dist = np.zeros(3, dtype=np.float32)
 
         # Public: readable by training callbacks
         self.last_dist    = 1.0
@@ -414,11 +424,15 @@ class DroneEnv(gymnasium.Env):
 
         if self.obs_noise:
             rng = self.np_random
-            obs[0:3]   += rng.normal(0, 0.01,  3).astype(np.float32)
-            obs[12:15] += rng.normal(0, 0.01,  3).astype(np.float32)
-            obs[15:18] += rng.normal(0, 0.05,  3).astype(np.float32)
+            obs[0:3]   += rng.normal(0, 0.01, 3).astype(np.float32)   # position  σ=1 cm
+            obs[3:12]  += rng.normal(0, 0.01, 9).astype(np.float32)   # rotation  σ≈0.01 rad (IMU)
+            obs[12:15] += rng.normal(0, 0.01, 3).astype(np.float32)   # lin. vel  σ=1 cm/s
+            obs[15:18] += rng.normal(0, 0.01, 3).astype(np.float32)   # ang. vel  σ=0.01 rad/s (gyro)
 
-        return obs.astype(np.float32)
+        obs = obs.astype(np.float32)
+        # Guard against physics blowup: NaN/inf obs would corrupt the whole batch.
+        np.nan_to_num(obs, copy=False, nan=0.0, posinf=10.0, neginf=-10.0)
+        return obs
 
     # ── Gymnasium reset ───────────────────────────────────────────────────
 
@@ -433,7 +447,9 @@ class DroneEnv(gymnasium.Env):
         if self._random_targets:
             self._target = _sample_random_target(rng)
         else:
-            self._target = TARGETS[0].copy()
+            # Training mode (paper): fixed centre target, drone spawns at random
+            # absolute position around it — equivalent to paper's "fly to origin"
+            self._target = TRAIN_TARGET.copy()
 
         # ── Curriculum-gated spawn extremes ──────────────────────────────
         # env.curriculum ∈ [0, 1] interpolates from an easy bootstrap distribution
@@ -508,6 +524,19 @@ class DroneEnv(gymnasium.Env):
                      self._state.body_q, self._model.body_com),
             outputs=(self._state.body_f,),
         )
+        if self.disturbances:
+            wp.launch(
+                _add_disturbance_force, dim=1,
+                inputs=(
+                    self._state.body_f,
+                    wp.vec3(float(self._force_dist[0]),
+                            float(self._force_dist[1]),
+                            float(self._force_dist[2])),
+                    wp.vec3(float(self._torque_dist[0]),
+                            float(self._torque_dist[1]),
+                            float(self._torque_dist[2])),
+                ),
+            )
         self._solver.step(self._state, self._state1, None, None, SIM_DT)
         self._state, self._state1 = self._state1, self._state
 
@@ -547,10 +576,18 @@ class DroneEnv(gymnasium.Env):
         reward = pos_c + orient_c + vel_c + ang_c + act_c + survival
 
         # ── Termination ───────────────────────────────────────────────────
-        # Paper Table 5 uses 0.6 m position error; we widen to 2.0 m so that
-        # spawns up to 1.5 m from the target don't terminate immediately.
-        # Ground impact kept as a physics-stability guard.
-        terminated = bool(z < 0.05 or dist > 2.0)
+        speed = float(np.linalg.norm(v))
+        terminated = bool(
+            z     < 0.05              or   # ground impact
+            z     > 6.0               or   # escaped upward
+            R22   < -0.5              or   # severely inverted
+            dist  > _TERMINATION_DIST or   # left the tight survival box
+            speed > 20.0              or   # physics blowup guard
+            not np.isfinite(z)             # NaN/inf state — reset immediately
+        )
+
+        crash_c = _C_CRASH if terminated else 0.0
+        reward += crash_c
 
         self._step_count += 1
         truncated         = self._step_count >= MAX_EPISODE_STEPS
@@ -573,10 +610,11 @@ class DroneEnv(gymnasium.Env):
             },
         }
         if terminated or truncated:
-            info["terminal_dist"]    = dist
-            info["terminal_upright"] = R22
-            info["terminal_ep_len"]  = self._step_count
-            info["terminal_reward"]  = self._ep_reward
+            info["terminal_dist"]     = dist
+            info["terminal_upright"]  = R22
+            info["terminal_ep_len"]   = self._step_count
+            info["terminal_reward"]   = self._ep_reward
+            info["terminal_survived"] = truncated
 
         if self.render_mode == "human":
             self.render()
